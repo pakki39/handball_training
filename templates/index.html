@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Video Organizer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="brand">Video Organizer</div>
+        <div class="mode">
+          <label><input type="radio" name="transferMode" value="copy" checked /> Copy</label>
+          <label><input type="radio" name="transferMode" value="move" /> Move</label>
+        </div>
+      </div>
+      <div id="status" class="status"></div>
+    </header>
+
+    <main class="container">
+      <section class="left">
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">Dateibrowser</div>
+            <div class="tag-search-controls">
+              <input id="tagQuery" class="input" type="text" placeholder="Tags suchen (z.B. Abwehr Angriff)" />
+              <select id="tagDropdown" class="select">
+                <option value="">Tag auswählen…</option>
+              </select>
+              <input id="nameQuery" class="input" type="text" placeholder="Dateiname suchen (z.B. canayer)" />
+              <button id="nameSearchBtn" class="btn" type="button">Name suchen</button>
+              <label class="tag-mode"><input type="radio" name="tagMode" value="and" checked /> UND</label>
+              <label class="tag-mode"><input type="radio" name="tagMode" value="or" /> ODER</label>
+              <button id="tagSearchBtn" class="btn btn-primary" type="button">Suchen</button>
+              <button id="tagRescanBtn" class="btn" type="button">Rescan</button>
+              <span id="tagIndexStatus" class="tag-index-status"></span>
+            </div>
+          </div>
+
+          <div class="panel-body">
+            <div class="browser-split">
+              <div class="browser-list">
+                <div class="browser-lists">
+                  <div class="tag-results-wrap">
+                    <div class="panel-subtitle" style="padding: 2px 0 6px 2px;">Tag-Suche (Scan: ~/pve/Handball)</div>
+                    <div id="tagResultsList" class="list"></div>
+                  </div>
+                  <div class="folder-wrap">
+                    <div id="folderList" class="list"></div>
+                  </div>
+                </div>
+              </div>
+              <div class="video-player-wrap">
+                <div id="playerMsg" class="player-msg"></div>
+                <div id="tagEditor" class="tag-editor">
+                  <div class="tag-editor-top">
+                    <div class="panel-subtitle">Tags (Dateiname)</div>
+                    <div id="tagEditorHint" class="tag-editor-hint"></div>
+                  </div>
+                  <div id="videoTags" class="tag-chips"></div>
+                  <div class="tag-editor-add">
+                    <input id="tagEditInput" class="input" type="text" placeholder="Tag hinzufügen…" list="tagSuggestions" />
+                    <datalist id="tagSuggestions"></datalist>
+                    <button id="tagAddBtn" class="btn" type="button">Hinzufügen</button>
+                  </div>
+                </div>
+                <div id="clipEditor" class="clip-editor">
+                  <div class="clip-editor-top">
+                    <div class="panel-subtitle">Clips (Marker → Segmente)</div>
+                    <div id="clipEditorHint" class="clip-editor-hint"></div>
+                  </div>
+                  <div class="clip-editor-controls">
+                    <button id="markerAddBtn" class="btn" type="button">Marker setzen</button>
+                    <button id="markerClearBtn" class="btn" type="button">Marker leeren</button>
+                    <button id="createAllClipsBtn" class="btn btn-primary" type="button">Alle Clips erstellen</button>
+                  </div>
+                  <div class="clip-editor-body">
+                    <div>
+                      <div class="panel-subtitle" style="padding: 4px 0 6px 2px;">Marker</div>
+                      <div id="markerList" class="clip-list"></div>
+                    </div>
+                    <div>
+                      <div class="panel-subtitle" style="padding: 4px 0 6px 2px;">Segmente</div>
+                      <div id="segmentList" class="clip-list"></div>
+                    </div>
+                  </div>
+                </div>
+                <video id="videoPlayer" controls preload="metadata" draggable="true"></video>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="right panel">
+        <div class="panel-header">
+          <div class="panel-title">Export (Reihenfolge sichern)</div>
+          <div class="panel-subtitle">
+            Ziel: <span id="exportBreadcrumb" class="mono"></span>
+          </div>
+          <div class="export-controls">
+            <input id="newExportFolder" class="input" type="text" placeholder="Neuer Ordnername" />
+            <button id="exportMkdir" class="btn" type="button">Anlegen</button>
+            <button id="exportRun" class="btn btn-primary" type="button">Export starten</button>
+          </div>
+        </div>
+
+        <div class="panel-body">
+          <div class="export-and-queue">
+            <div class="export-pane">
+              <div id="exportFolderList" class="list"></div>
+            </div>
+
+            <div class="queue-pane">
+              <div class="queue-header">
+                <div class="panel-title" style="padding: 6px 0 8px 0;">Queue (Drop Zone)</div>
+                <button id="queueClearAll" class="btn" type="button">Alle löschen</button>
+              </div>
+              <div id="dropZone" class="dropzone">
+                <div class="dropzone-hint">Videos hierher ziehen</div>
+                <div id="queueList" class="queue"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
