@@ -223,6 +223,10 @@ html, body {
   flex-direction: column;
 }
 
+#mergeProfile {
+  min-width: 160px;
+}
+
 .list {
   border: 1px solid var(--border);
   border-radius: 10px;

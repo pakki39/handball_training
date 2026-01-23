@@ -1509,11 +1509,13 @@ function setMergeProgress({ visible, pct = 0, text = "" }) {
 
 async function startMergeDownload() {
   const btn = $("mergeDownloadBtn");
+  const profileEl = $("mergeProfile");
+  const profile = profileEl ? String(profileEl.value || "android_small") : "android_small";
   if (btn) btn.disabled = true;
   setMergeProgress({ visible: true, pct: 0, text: "Starte Merge…" });
 
   try {
-    const resp = await apiPost("/api/merge/start", {});
+    const resp = await apiPost("/api/merge/start", { profile });
     const jobId = resp && resp.job_id;
     if (!jobId) {
       throw new Error("Merge-Job konnte nicht gestartet werden.");
@@ -1559,7 +1561,10 @@ function setupMergeDownloadUI() {
         setStatus("Queue ist leer.", "error");
         return;
       }
-      if (!window.confirm(`Alle Videos in der Queue (${state.queue.length}) zu einem Video mergen und downloaden?`)) {
+      const profileEl = $("mergeProfile");
+      const profile = profileEl ? String(profileEl.value || "android_small") : "android_small";
+      const profileLabel = profile === "copy" ? "Original (Copy)" : "Android (klein)";
+      if (!window.confirm(`Alle Videos in der Queue (${state.queue.length}) zu einem Video mergen und downloaden?\n\nProfil: ${profileLabel}`)) {
         return;
       }
       await startMergeDownload();

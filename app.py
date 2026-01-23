@@ -284,7 +284,7 @@ def _merge_job_update(job_id: str, **kwargs):
         _merge_job_save(job_id, job)
 
 
-def _start_merge_job(target_relpaths: list[str]) -> str:
+def _start_merge_job(target_relpaths: list[str], profile: str) -> str:
     job_id = str(uuid.uuid4())
 
     with _MERGE_JOBS_LOCK:
@@ -295,6 +295,7 @@ def _start_merge_job(target_relpaths: list[str]) -> str:
             "message": "",
             "progress_pct": 0,
             "created_at": time.time(),
+            "profile": profile,
             "output_abs": None,
             "error": None,
         }
@@ -319,7 +320,8 @@ def _start_merge_job(target_relpaths: list[str]) -> str:
             if total <= 0:
                 total = 1.0
 
-            _merge_job_update(job_id, phase="Merge", message="ffmpeg läuft…")
+            profile_label = "Android (klein)" if profile == "android_small" else "Original (Copy)"
+            _merge_job_update(job_id, phase="Merge", message=f"ffmpeg läuft… ({profile_label})")
 
             out_abs = os.path.join(_merge_jobs_dir(), f"merged_{job_id}.mp4")
             list_fd, list_path = tempfile.mkstemp(prefix=f"concat_{job_id}_", suffix=".txt")
@@ -333,6 +335,8 @@ def _start_merge_job(target_relpaths: list[str]) -> str:
 
                 cmd = [
                     ffmpeg_bin,
+                    "-y",
+                    "-nostdin",
                     "-hide_banner",
                     "-loglevel",
                     "error",
@@ -342,37 +346,58 @@ def _start_merge_job(target_relpaths: list[str]) -> str:
                     "0",
                     "-i",
                     list_path,
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "20",
-                    "-c:a",
-                    "aac",
-                    "-movflags",
-                    "+faststart",
                     "-progress",
                     "pipe:1",
                     "-nostats",
                     out_abs,
                 ]
 
+                if profile == "copy":
+                    cmd[cmd.index("-progress") : cmd.index("-progress")] = [
+                        "-c",
+                        "copy",
+                        "-movflags",
+                        "+faststart",
+                    ]
+                else:
+                    cmd[cmd.index("-progress") : cmd.index("-progress")] = [
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "medium",
+                        "-crf",
+                        "24",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "128k",
+                        "-movflags",
+                        "+faststart",
+                    ]
+
                 proc = subprocess.Popen(
                     cmd,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
                 )
 
                 out_time_ms = 0
+                tail = []
+                tail_limit = 200
                 if proc.stdout:
                     for line in proc.stdout:
                         line = line.strip()
                         if not line:
                             continue
                         if "=" not in line:
+                            tail.append(line)
+                            if len(tail) > tail_limit:
+                                tail = tail[-tail_limit:]
                             continue
                         k, v = line.split("=", 1)
                         if k == "out_time_ms":
@@ -386,14 +411,8 @@ def _start_merge_job(target_relpaths: list[str]) -> str:
                             break
 
                 rc = proc.wait()
-                stderr = ""
-                if proc.stderr:
-                    try:
-                        stderr = proc.stderr.read().strip()
-                    except Exception:
-                        stderr = ""
-
                 if rc != 0 or not os.path.isfile(out_abs):
+                    stderr = "\n".join(tail).strip()
                     raise RuntimeError(stderr or f"ffmpeg exit {rc}")
 
                 _merge_job_update(job_id, status="done", phase="Fertig", progress_pct=100, output_abs=out_abs)
@@ -877,6 +896,11 @@ def api_queue_clear():
 
 @app.route("/api/merge/start", methods=["POST"])
 def api_merge_start():
+    body = request.get_json(silent=True) or {}
+    profile = body.get("profile", "android_small")
+    if profile not in ("android_small", "copy"):
+        profile = "android_small"
+
     items = _queue_get_items()
     if not items:
         return _json_error("Queue ist leer.", 400, code="empty_queue")
@@ -886,7 +910,7 @@ def api_merge_start():
         return _json_error("Queue ist leer.", 400, code="empty_queue")
 
     try:
-        job_id = _start_merge_job(rels)
+        job_id = _start_merge_job(rels, profile)
         return jsonify({"ok": True, "job_id": job_id, "count": len(rels)})
     except Exception:
         return _json_error("Merge konnte nicht gestartet werden.", 500, code="server_error")
