@@ -8,6 +8,9 @@ import time
 import threading
 import subprocess
 import math
+import uuid
+import tempfile
+import json
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template, request, send_file, g, Response
@@ -18,10 +21,27 @@ app = Flask(__name__)
 app.config.from_object(config)
 
 
+def _resolve_tool_binary(name: str) -> str | None:
+    p = shutil.which(name)
+    if p and os.path.isfile(p):
+        return p
+    for cand in (f"/usr/bin/{name}", f"/usr/local/bin/{name}", f"/bin/{name}"):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _tool_missing_details(name: str):
+    return {
+        "tool": name,
+        "path": os.environ.get("PATH", ""),
+        "which": shutil.which(name),
+    }
+
+
 def _ensure_dirs():
     os.makedirs(app.config["VIDEO_ROOT"], exist_ok=True)
     os.makedirs(app.config["TARGET_ROOT"], exist_ok=True)
-    os.makedirs(app.config["EXPORT_ROOT"], exist_ok=True)
     os.makedirs(os.path.dirname(app.config["DB_PATH"]), exist_ok=True)
 
 
@@ -191,20 +211,203 @@ def _queue_add_item(target_relpath: str, source_relpath: str | None = None):
     return item, True
 
 
-def _clear_directory_contents(dir_abs: str):
-    with os.scandir(dir_abs) as it:
-        for entry in it:
-            p = os.path.join(dir_abs, entry.name)
-            if entry.is_dir(follow_symlinks=False):
-                shutil.rmtree(p)
-            else:
-                os.remove(p)
-
-
 _TAG_INDEX_CACHE = {}
 _TAG_INDEX_LOCK = threading.Lock()
 _TAG_INDEX_BUILDING = False
 _TAG_INDEX_LAST_ERROR = None
+
+
+_MERGE_JOBS = {}
+_MERGE_JOBS_LOCK = threading.Lock()
+
+
+def _merge_jobs_dir() -> str:
+    d = os.path.join(os.path.dirname(app.config["DB_PATH"]), "merge_jobs")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _merge_job_state_path(job_id: str) -> str:
+    return os.path.join(_merge_jobs_dir(), f"job_{job_id}.json")
+
+
+def _merge_job_save(job_id: str, job: dict):
+    try:
+        p = _merge_job_state_path(job_id)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(job, f)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def _merge_job_load(job_id: str) -> dict | None:
+    try:
+        p = _merge_job_state_path(job_id)
+        if not os.path.isfile(p):
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _ffprobe_duration_seconds(abs_path: str) -> float:
+    ffprobe_bin = _resolve_tool_binary("ffprobe")
+    if not ffprobe_bin:
+        return 0.0
+    cmd = [
+        ffprobe_bin,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        abs_path,
+    ]
+    try:
+        out = subprocess.check_output(cmd, text=True).strip()
+        return float(out)
+    except Exception:
+        return 0.0
+
+
+def _merge_job_update(job_id: str, **kwargs):
+    with _MERGE_JOBS_LOCK:
+        job = _MERGE_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(kwargs)
+        _merge_job_save(job_id, job)
+
+
+def _start_merge_job(target_relpaths: list[str]) -> str:
+    job_id = str(uuid.uuid4())
+
+    with _MERGE_JOBS_LOCK:
+        _MERGE_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "running",
+            "phase": "Vorbereitung",
+            "message": "",
+            "progress_pct": 0,
+            "created_at": time.time(),
+            "output_abs": None,
+            "error": None,
+        }
+        _merge_job_save(job_id, _MERGE_JOBS[job_id])
+
+    def _worker():
+        try:
+            ffmpeg_bin = _resolve_tool_binary("ffmpeg")
+            if not ffmpeg_bin:
+                d = _tool_missing_details("ffmpeg")
+                raise FileNotFoundError(f"ffmpeg nicht gefunden (which={d.get('which')}, PATH={d.get('path')})")
+
+            abs_paths = []
+            total = 0.0
+            for rp in target_relpaths:
+                abs_p, _ = _safe_abs_path(app.config["TARGET_ROOT"], rp)
+                if not os.path.isfile(abs_p):
+                    raise FileNotFoundError(f"missing: {rp}")
+                abs_paths.append(abs_p)
+                total += max(0.0, _ffprobe_duration_seconds(abs_p))
+
+            if total <= 0:
+                total = 1.0
+
+            _merge_job_update(job_id, phase="Merge", message="ffmpeg läuft…")
+
+            out_abs = os.path.join(_merge_jobs_dir(), f"merged_{job_id}.mp4")
+            list_fd, list_path = tempfile.mkstemp(prefix=f"concat_{job_id}_", suffix=".txt")
+            os.close(list_fd)
+
+            try:
+                with open(list_path, "w", encoding="utf-8") as f:
+                    for p in abs_paths:
+                        p_escaped = p.replace("'", "\\'")
+                        f.write(f"file '{p_escaped}'\n")
+
+                cmd = [
+                    ffmpeg_bin,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    list_path,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "20",
+                    "-c:a",
+                    "aac",
+                    "-movflags",
+                    "+faststart",
+                    "-progress",
+                    "pipe:1",
+                    "-nostats",
+                    out_abs,
+                ]
+
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+
+                out_time_ms = 0
+                if proc.stdout:
+                    for line in proc.stdout:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        if k == "out_time_ms":
+                            try:
+                                out_time_ms = int(v)
+                            except Exception:
+                                out_time_ms = out_time_ms
+                            pct = max(0, min(99, int((out_time_ms / 1_000_000) / total * 100)))
+                            _merge_job_update(job_id, progress_pct=pct, phase="Merge")
+                        elif k == "progress" and v == "end":
+                            break
+
+                rc = proc.wait()
+                stderr = ""
+                if proc.stderr:
+                    try:
+                        stderr = proc.stderr.read().strip()
+                    except Exception:
+                        stderr = ""
+
+                if rc != 0 or not os.path.isfile(out_abs):
+                    raise RuntimeError(stderr or f"ffmpeg exit {rc}")
+
+                _merge_job_update(job_id, status="done", phase="Fertig", progress_pct=100, output_abs=out_abs)
+            finally:
+                try:
+                    os.remove(list_path)
+                except Exception:
+                    pass
+        except Exception as e:
+            _merge_job_update(job_id, status="error", phase="Fehler", error=str(e))
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return job_id
 
 
 def _extract_tags_from_filename(filename: str) -> list[str]:
@@ -477,29 +680,9 @@ def _list_dir(root: str, relpath: str | None):
         "videos": videos,
     }
 
-
-def _list_dirs_only(root: str, relpath: str | None):
-    data = _list_dir(root, relpath)
-    return {
-        "current_path": data["current_path"],
-        "parent_path": data["parent_path"],
-        "folders": data["folders"],
-    }
-
-
 def _unique_destination_filename(dest_dir_abs: str, filename: str):
     base, ext = os.path.splitext(filename)
     candidate = filename
-    i = 1
-    while os.path.exists(os.path.join(dest_dir_abs, candidate)):
-        candidate = f"{base}_{i}{ext}"
-        i += 1
-    return candidate
-
-
-def _unique_export_name(dest_dir_abs: str, prefixed_filename: str):
-    base, ext = os.path.splitext(prefixed_filename)
-    candidate = prefixed_filename
     i = 1
     while os.path.exists(os.path.join(dest_dir_abs, candidate)):
         candidate = f"{base}_{i}{ext}"
@@ -692,111 +875,84 @@ def api_queue_clear():
     return jsonify({"ok": True, "deleted_count": count})
 
 
-@app.route("/api/export/list", methods=["GET"])
-def api_export_list():
-    rel = request.args.get("path", "")
-    try:
-        data = _list_dirs_only(app.config["EXPORT_ROOT"], rel)
-        return jsonify(data)
-    except ValueError:
-        return _json_error("Ungültiger Pfad.", 400, code="invalid_path")
-    except FileNotFoundError:
-        return _json_error("Ordner nicht gefunden.", 404, code="not_found")
+@app.route("/api/merge/start", methods=["POST"])
+def api_merge_start():
+    items = _queue_get_items()
+    if not items:
+        return _json_error("Queue ist leer.", 400, code="empty_queue")
 
-
-@app.route("/api/export/mkdir", methods=["POST"])
-def api_export_mkdir():
-    body = request.get_json(silent=True) or {}
-    parent_path = body.get("parent_path", "")
-    folder_name = body.get("folder_name")
-
-    if folder_name is None or not isinstance(folder_name, str) or folder_name.strip() == "":
-        return _json_error("folder_name fehlt.", 400, code="bad_request")
-
-    folder_name = folder_name.strip()
-    if "/" in folder_name or "\\" in folder_name:
-        return _json_error("folder_name darf keine Pfadtrenner enthalten.", 400, code="bad_request")
-
-    if folder_name in (".", ".."):
-        return _json_error("Ungültiger Ordnername.", 400, code="bad_request")
+    rels = [it["target_relpath"] for it in items if it.get("target_relpath")]
+    if not rels:
+        return _json_error("Queue ist leer.", 400, code="empty_queue")
 
     try:
-        parent_abs, parent_norm = _safe_abs_path(app.config["EXPORT_ROOT"], parent_path)
-        if not os.path.isdir(parent_abs):
-            return _json_error("Parent-Ordner nicht gefunden.", 404, code="not_found")
-
-        new_rel = folder_name if parent_norm == "" else f"{parent_norm}/{folder_name}"
-        new_abs, _ = _safe_abs_path(app.config["EXPORT_ROOT"], new_rel)
-        os.makedirs(new_abs, exist_ok=False)
-        return jsonify({"ok": True, "created": new_rel})
-    except FileExistsError:
-        return _json_error("Ordner existiert bereits.", 409, code="already_exists")
-    except ValueError:
-        return _json_error("Ungültiger Pfad.", 400, code="invalid_path")
+        job_id = _start_merge_job(rels)
+        return jsonify({"ok": True, "job_id": job_id, "count": len(rels)})
     except Exception:
-        return _json_error("Ordner konnte nicht erstellt werden.", 500, code="server_error")
+        return _json_error("Merge konnte nicht gestartet werden.", 500, code="server_error")
 
 
-@app.route("/api/export/run", methods=["POST"])
-def api_export_run():
-    body = request.get_json(silent=True) or {}
-    destination_subdir = body.get("destination_subdir", "")
-    clear_destination = bool(body.get("clear_destination", False))
+@app.route("/api/merge/status", methods=["GET"])
+def api_merge_status():
+    job_id = request.args.get("job_id", "")
+    if not job_id:
+        return _json_error("job_id fehlt.", 400, code="bad_request")
+    disk_job = _merge_job_load(job_id)
+    with _MERGE_JOBS_LOCK:
+        job = disk_job or _MERGE_JOBS.get(job_id)
+        if job and not disk_job:
+            _merge_job_save(job_id, job)
+        if job:
+            _MERGE_JOBS[job_id] = job
 
-    try:
-        dest_abs, dest_norm = _safe_abs_path(app.config["EXPORT_ROOT"], destination_subdir)
-        os.makedirs(dest_abs, exist_ok=True)
+    if not job:
+        return _json_error("Job nicht gefunden.", 404, code="not_found")
 
-        has_any = any(True for _ in os.scandir(dest_abs))
-        if has_any and not clear_destination:
-            return _json_error(
-                "Zielordner ist nicht leer.",
-                409,
-                code="destination_not_empty",
-                details={"destination_relpath": dest_norm},
-            )
-        if has_any and clear_destination:
-            _clear_directory_contents(dest_abs)
+    out_abs = job.get("output_abs")
+    output_exists = bool(out_abs and isinstance(out_abs, str) and os.path.isfile(out_abs))
+    download_ready = job.get("status") == "done" and output_exists
 
-        items = _queue_get_items()
-        if not items:
-            return _json_error("Queue ist leer.", 400, code="empty_queue")
+    return jsonify(
+        {
+            "ok": True,
+            "job_id": job_id,
+            "status": job.get("status"),
+            "phase": job.get("phase"),
+            "message": job.get("message"),
+            "progress_pct": job.get("progress_pct", 0),
+            "error": job.get("error"),
+            "download_ready": download_ready,
+        }
+    )
 
-        pad = max(3, len(str(len(items))))
 
-        exported = []
-        skipped = []
-
-        for idx, it in enumerate(items, start=1):
-            src_abs, _ = _safe_abs_path(app.config["TARGET_ROOT"], it["target_relpath"])
-            if not os.path.isfile(src_abs):
-                skipped.append({"id": it["id"], "target_relpath": it["target_relpath"], "reason": "missing_source"})
-                continue
-
-            base, ext = os.path.splitext(it["filename"])
-            prefixed = f"{idx:0{pad}d}_{base}{ext}"
-            prefixed = _unique_export_name(dest_abs, prefixed)
-            dest_file_abs = os.path.join(dest_abs, prefixed)
-
-            shutil.copy2(src_abs, dest_file_abs)
-
-            dest_rel = prefixed if dest_norm == "" else f"{dest_norm}/{prefixed}"
-            exported.append({"id": it["id"], "dest_relpath": dest_rel, "dest_filename": prefixed})
-
-        return jsonify(
-            {
-                "ok": True,
-                "destination_relpath": dest_norm,
-                "exported_count": len(exported),
-                "skipped_count": len(skipped),
-                "exported": exported,
-                "skipped": skipped,
-            }
+@app.route("/api/merge/download/<job_id>", methods=["GET"])
+def api_merge_download(job_id):
+    disk_job = _merge_job_load(job_id)
+    with _MERGE_JOBS_LOCK:
+        job = disk_job or _MERGE_JOBS.get(job_id)
+        if job:
+            _MERGE_JOBS[job_id] = job
+    if not job:
+        return _json_error("Job nicht gefunden.", 404, code="not_found")
+    if job.get("status") != "done":
+        return _json_error(
+            "Job ist nicht fertig.",
+            409,
+            code="not_ready",
+            details={"status": job.get("status"), "phase": job.get("phase"), "message": job.get("message")},
         )
-    except ValueError:
-        return _json_error("Ungültiger Pfad.", 400, code="invalid_path")
-    except Exception:
-        return _json_error("Export fehlgeschlagen.", 500, code="server_error")
+    out_abs = job.get("output_abs")
+    if not out_abs or not os.path.isfile(out_abs):
+        return _json_error("Datei nicht gefunden.", 404, code="not_found")
+
+    return send_file(
+        out_abs,
+        mimetype="video/mp4",
+        as_attachment=True,
+        download_name="merged_queue.mp4",
+        conditional=False,
+    )
 
 
 @app.route("/api/tags/search", methods=["POST"])
@@ -918,6 +1074,91 @@ def api_tags_edit():
         return _json_error("Tag-Update fehlgeschlagen.", 500, code="server_error")
 
 
+@app.route("/api/files/delete", methods=["POST"])
+def api_files_delete():
+    body = request.get_json(silent=True) or {}
+    relpath = body.get("relpath")
+
+    if not relpath or not isinstance(relpath, str):
+        return _json_error("relpath fehlt.", 400, code="bad_request")
+
+    try:
+        abs_path, norm = _safe_abs_path(app.config["VIDEO_ROOT"], relpath)
+
+        if os.path.isdir(abs_path):
+            return _json_error("Ordner können nicht gelöscht werden.", 400, code="bad_request")
+        if not os.path.isfile(abs_path):
+            return _json_error("Datei nicht gefunden.", 404, code="not_found")
+        if not _is_allowed_video_filename(os.path.basename(norm)):
+            return _json_error("Nicht erlaubte Video-Endung.", 400, code="invalid_video_extension")
+
+        os.remove(abs_path)
+        _start_tag_index_build()
+        return jsonify({"ok": True, "deleted": norm})
+    except ValueError:
+        return _json_error("Ungültiger Pfad.", 400, code="invalid_path")
+    except Exception:
+        return _json_error("Löschen fehlgeschlagen.", 500, code="server_error")
+
+
+@app.route("/api/files/rename", methods=["POST"])
+def api_files_rename():
+    body = request.get_json(silent=True) or {}
+    relpath = body.get("relpath")
+    new_name = body.get("new_name")
+
+    if not relpath or not isinstance(relpath, str):
+        return _json_error("relpath fehlt.", 400, code="bad_request")
+    if new_name is None or not isinstance(new_name, str) or new_name.strip() == "":
+        return _json_error("new_name fehlt.", 400, code="bad_request")
+
+    new_name = new_name.strip()
+    if "/" in new_name or "\\" in new_name:
+        return _json_error("new_name darf keine Pfadtrenner enthalten.", 400, code="bad_request")
+    if new_name in (".", ".."):
+        return _json_error("Ungültiger Dateiname.", 400, code="bad_request")
+
+    try:
+        src_abs, src_norm = _safe_abs_path(app.config["VIDEO_ROOT"], relpath)
+        if os.path.isdir(src_abs):
+            return _json_error("Ordner können nicht umbenannt werden.", 400, code="bad_request")
+        if not os.path.isfile(src_abs):
+            return _json_error("Datei nicht gefunden.", 404, code="not_found")
+
+        old_filename = os.path.basename(src_norm)
+        old_base, old_ext = os.path.splitext(old_filename)
+        if not _is_allowed_video_filename(old_filename):
+            return _json_error("Nicht erlaubte Video-Endung.", 400, code="invalid_video_extension")
+
+        new_base, new_ext = os.path.splitext(new_name)
+        if new_ext == "":
+            new_name = f"{new_name}{old_ext}"
+            new_base, new_ext = os.path.splitext(new_name)
+
+        if new_ext.lower() != old_ext.lower():
+            return _json_error("Dateiendung darf nicht geändert werden.", 400, code="bad_request")
+        if not _is_allowed_video_filename(new_name):
+            return _json_error("Nicht erlaubte Video-Endung.", 400, code="invalid_video_extension")
+
+        if new_name == old_filename:
+            return jsonify({"ok": True, "changed": False, "relpath": src_norm, "name": old_filename})
+
+        dir_norm = posixpath.dirname(src_norm)
+        dst_rel = new_name if dir_norm in ("", ".") else f"{dir_norm}/{new_name}"
+        dst_abs, dst_norm = _safe_abs_path(app.config["VIDEO_ROOT"], dst_rel)
+
+        if os.path.exists(dst_abs):
+            return _json_error("Zieldatei existiert bereits.", 409, code="conflict")
+
+        os.rename(src_abs, dst_abs)
+        _start_tag_index_build()
+        return jsonify({"ok": True, "changed": True, "relpath": dst_norm, "name": new_name})
+    except ValueError:
+        return _json_error("Ungültiger Pfad.", 400, code="invalid_path")
+    except Exception:
+        return _json_error("Umbenennen fehlgeschlagen.", 500, code="server_error")
+
+
 def _next_clip_filename(dir_abs: str, base_stem: str, ext: str, tags: list[str]) -> tuple[str, int]:
     i = 1
     while True:
@@ -944,6 +1185,15 @@ def api_clips_create():
         return _json_error("Zu viele Segmente.", 400, code="bad_request")
 
     try:
+        ffmpeg_bin = _resolve_tool_binary("ffmpeg")
+        if not ffmpeg_bin:
+            return _json_error(
+                "ffmpeg nicht gefunden. Bitte ffmpeg installieren.",
+                500,
+                code="ffmpeg_missing",
+                details=_tool_missing_details("ffmpeg"),
+            )
+
         src_abs, src_norm = _safe_abs_path(app.config["VIDEO_ROOT"], relpath)
         if not os.path.isfile(src_abs):
             return _json_error("Datei nicht gefunden.", 404, code="not_found")
@@ -981,7 +1231,7 @@ def api_clips_create():
             dst_abs, dst_norm = _safe_abs_path(app.config["VIDEO_ROOT"], new_relpath)
 
             cmd = [
-                "ffmpeg",
+                ffmpeg_bin,
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -1001,7 +1251,12 @@ def api_clips_create():
             try:
                 subprocess.run(cmd, check=True, capture_output=True, text=True)
             except FileNotFoundError:
-                return _json_error("ffmpeg nicht gefunden. Bitte ffmpeg installieren.", 500, code="ffmpeg_missing")
+                return _json_error(
+                    "ffmpeg nicht gefunden. Bitte ffmpeg installieren.",
+                    500,
+                    code="ffmpeg_missing",
+                    details=_tool_missing_details("ffmpeg"),
+                )
             except subprocess.CalledProcessError as e:
                 msg = (e.stderr or "").strip() or "ffmpeg Fehler"
                 return _json_error("Clip-Erstellung fehlgeschlagen.", 500, code="ffmpeg_error", details={"stderr": msg})

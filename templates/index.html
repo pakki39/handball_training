@@ -3,19 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Video Organizer</title>
+    <title>Handball</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
   </head>
   <body>
     <header class="topbar">
-      <div class="topbar-left">
-        <div class="brand">Video Organizer</div>
-        <div class="mode">
-          <label><input type="radio" name="transferMode" value="copy" checked /> Copy</label>
-          <label><input type="radio" name="transferMode" value="move" /> Move</label>
-        </div>
-      </div>
+      <div class="app-title">Video Organizer</div>
       <div id="status" class="status"></div>
     </header>
 
@@ -47,6 +41,7 @@
                     <div class="panel-subtitle" style="padding: 2px 0 6px 2px;">Tag-Suche (Scan: ~/pve/Handball)</div>
                     <div id="tagResultsList" class="list"></div>
                   </div>
+                  <div id="browserHSplitter" class="splitter-h"></div>
                   <div class="folder-wrap">
                     <div id="folderList" class="list"></div>
                   </div>
@@ -81,12 +76,9 @@
                       <div class="panel-subtitle" style="padding: 4px 0 6px 2px;">Marker</div>
                       <div id="markerList" class="clip-list"></div>
                     </div>
-                    <div>
-                      <div class="panel-subtitle" style="padding: 4px 0 6px 2px;">Segmente</div>
-                      <div id="segmentList" class="clip-list"></div>
-                    </div>
                   </div>
                 </div>
+                <div id="markerTimeline" class="marker-timeline" tabindex="0"></div>
                 <video id="videoPlayer" controls preload="metadata" draggable="true"></video>
               </div>
             </div>
@@ -96,33 +88,25 @@
 
       <aside class="right panel">
         <div class="panel-header">
-          <div class="panel-title">Export (Reihenfolge sichern)</div>
-          <div class="panel-subtitle">
-            Ziel: <span id="exportBreadcrumb" class="mono"></span>
+          <div class="queue-header">
+            <div class="panel-title" style="padding: 6px 0 8px 0;">Queue (Drop Zone)</div>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <button id="mergeDownloadBtn" class="btn btn-primary" type="button">Download (Merge)</button>
+              <button id="queueClearAll" class="btn" type="button">Alle löschen</button>
+            </div>
           </div>
-          <div class="export-controls">
-            <input id="newExportFolder" class="input" type="text" placeholder="Neuer Ordnername" />
-            <button id="exportMkdir" class="btn" type="button">Anlegen</button>
-            <button id="exportRun" class="btn btn-primary" type="button">Export starten</button>
+          <div id="mergeProgressWrap" style="margin-top: 8px; display:none;">
+            <div class="progress">
+              <div id="mergeProgressBar" class="progress-bar" style="width:0%"></div>
+            </div>
+            <div id="mergeProgressText" class="progress-text"></div>
           </div>
         </div>
 
         <div class="panel-body">
-          <div class="export-and-queue">
-            <div class="export-pane">
-              <div id="exportFolderList" class="list"></div>
-            </div>
-
-            <div class="queue-pane">
-              <div class="queue-header">
-                <div class="panel-title" style="padding: 6px 0 8px 0;">Queue (Drop Zone)</div>
-                <button id="queueClearAll" class="btn" type="button">Alle löschen</button>
-              </div>
-              <div id="dropZone" class="dropzone">
-                <div class="dropzone-hint">Videos hierher ziehen</div>
-                <div id="queueList" class="queue"></div>
-              </div>
-            </div>
+          <div id="dropZone" class="dropzone">
+            <div class="dropzone-hint">Videos hierher ziehen</div>
+            <div id="queueList" class="queue"></div>
           </div>
         </div>
       </aside>

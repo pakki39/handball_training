@@ -4,8 +4,6 @@ let state = {
   lastResultsKind: "tag",
   queue: [],
   sortable: null,
-  exportPath: "",
-  exportList: null,
   currentVideo: null,
   tagResults: [],
   tagIndex: { tags: [], building: false, error: null },
@@ -67,6 +65,14 @@ function setClipEditorHint(text) {
   const el = $("clipEditorHint");
   if (!el) return;
   el.textContent = text || "";
+}
+
+function isTypingTarget(el) {
+  if (!el) return false;
+  const tag = String(el.tagName || "").toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+  if (el.isContentEditable) return true;
+  return false;
 }
 
 function formatTime(sec) {
@@ -154,6 +160,60 @@ function renderMarkerList() {
   }
 }
 
+async function renameSourceVideoFile(relpath, displayName) {
+  const rp = String(relpath || "");
+  if (!rp) return;
+  const newName = String(displayName || "").trim();
+  if (!newName) return;
+
+  try {
+    const resp = await apiPost("/api/files/rename", { relpath: rp, new_name: newName });
+    if (!resp || !resp.ok) {
+      setStatus("Umbenennen fehlgeschlagen.", "error");
+      return;
+    }
+
+    const newRelpath = resp.relpath || rp;
+    const newFilename = resp.name || filenameFromRelpath(newRelpath) || newName;
+
+    if (resp.changed && state.currentVideo && state.currentVideo.kind === "source" && state.currentVideo.relpath === rp) {
+      state.currentVideo.relpath = newRelpath;
+      const player = $("videoPlayer");
+      if (player) {
+        player.src = `/media/source/${encodePath(newRelpath)}`;
+        player.load();
+        player.play().catch(() => {});
+      }
+      refreshTagEditorForCurrentVideo();
+      refreshClipEditorForCurrentVideo();
+    }
+
+    if (Array.isArray(state.tagResults) && state.tagResults.length > 0) {
+      let anyChanged = false;
+      for (const r of state.tagResults) {
+        if (r && r.relpath === rp) {
+          r.relpath = newRelpath;
+          r.name = newFilename;
+          anyChanged = true;
+        }
+      }
+      if (anyChanged) {
+        renderResults(state.lastResultsKind || "tag", state.tagResults);
+      }
+    }
+
+    await loadList(state.currentPath);
+    await loadTagIndex({ refresh: true });
+    await waitForTagIndexReady({ maxMs: 60000 });
+    updateTagSuggestions();
+    updateActivePlayingHighlights();
+
+    setStatus("Datei umbenannt.", "ok");
+  } catch (e) {
+    setStatus(e.message, "error");
+  }
+}
+
 function renderSegmentList() {
   const wrap = $("segmentList");
   if (!wrap) return;
@@ -192,6 +252,7 @@ function refreshClipEditorForCurrentVideo() {
     setClipEditorEnabled(false);
     renderMarkerList();
     renderSegmentList();
+    renderMarkerTimeline();
     return;
   }
 
@@ -199,6 +260,766 @@ function refreshClipEditorForCurrentVideo() {
   setClipEditorEnabled(!state.clipBusy);
   renderMarkerList();
   renderSegmentList();
+  renderMarkerTimeline();
+}
+
+function addMarkerAtTime(t) {
+  const tt = Number(t);
+  if (!Number.isFinite(tt) || tt < 0) return;
+  state.clipMarkers = _sortedUniqueMarkers([...(state.clipMarkers || []), tt]);
+  refreshClipEditorForCurrentVideo();
+}
+
+function bindFileContextMenu(rowEl, relpath, displayName) {
+  if (!rowEl) return;
+  const rp = String(relpath || "");
+  if (!rp) return;
+  const dn = String(displayName || "");
+
+  rowEl.addEventListener("contextmenu", (e) => {
+    if (e.defaultPrevented) return;
+    e.preventDefault();
+    e.stopPropagation();
+    _showFileMenuAt(e.clientX, e.clientY, rp, dn);
+  });
+
+  rowEl.addEventListener("mousedown", (e) => {
+    if (e.button !== 2) return;
+    if (e.defaultPrevented) return;
+    e.preventDefault();
+    e.stopPropagation();
+    _showFileMenuAt(e.clientX, e.clientY, rp, dn);
+  });
+}
+
+function setupGlobalFileContextMenu() {
+  const handle = (e) => {
+    const t = e.target;
+    if (!t || !(t instanceof Element)) return;
+    const row = t.closest('.item[data-relpath]');
+    if (!row) return;
+
+    const inFolder = row.closest('#folderList');
+    const inTags = row.closest('#tagResultsList');
+    if (!inFolder && !inTags) return;
+
+    const rp = row.getAttribute('data-relpath') || "";
+    if (!rp) return;
+
+    const nameEl = row.querySelector('.name');
+    const name = nameEl ? String(nameEl.textContent || "").trim() : filenameFromRelpath(rp);
+
+    e.preventDefault();
+    e.stopPropagation();
+    _showFileMenuAt(e.clientX, e.clientY, rp, name);
+  };
+
+  document.addEventListener(
+    "contextmenu",
+    (e) => {
+      handle(e);
+    },
+    true
+  );
+
+  document.addEventListener(
+    "pointerdown",
+    (e) => {
+      if (e.button !== 2) return;
+      handle(e);
+    },
+    true
+  );
+}
+
+function setupBrowserListSplitter() {
+  const splitter = document.getElementById("browserHSplitter");
+  const container = document.querySelector(".browser-lists");
+  const tagWrap = document.querySelector(".tag-results-wrap");
+  const folderWrap = document.querySelector(".folder-wrap");
+  if (!splitter || !container || !tagWrap || !folderWrap) return;
+
+  const storageKey = "browser.tagResultsHeightPx";
+  const saved = Number(window.localStorage.getItem(storageKey));
+  if (Number.isFinite(saved) && saved > 0) {
+    tagWrap.style.flex = `0 0 ${Math.round(saved)}px`;
+  }
+
+  let dragging = false;
+  let startY = 0;
+  let startH = 0;
+
+  const minTag = 120;
+  const minFolder = 120;
+
+  const clampAndApply = (newHeightPx) => {
+    const containerH = container.getBoundingClientRect().height;
+    const splitterH = splitter.getBoundingClientRect().height || 8;
+    const maxTag = Math.max(minTag, containerH - splitterH - minFolder);
+    const h = Math.max(minTag, Math.min(newHeightPx, maxTag));
+    tagWrap.style.flex = `0 0 ${Math.round(h)}px`;
+  };
+
+  splitter.addEventListener("dblclick", (e) => {
+    e.preventDefault();
+    try {
+      window.localStorage.removeItem(storageKey);
+    } catch (_) {}
+    tagWrap.style.flex = "0 0 38%";
+  });
+
+  splitter.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    startY = e.clientY;
+    startH = tagWrap.getBoundingClientRect().height;
+    try {
+      splitter.setPointerCapture(e.pointerId);
+    } catch (_) {}
+    e.preventDefault();
+  });
+
+  splitter.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const delta = e.clientY - startY;
+    clampAndApply(startH + delta);
+    e.preventDefault();
+  });
+
+  const endDrag = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    try {
+      splitter.releasePointerCapture(e.pointerId);
+    } catch (_) {}
+    const h = tagWrap.getBoundingClientRect().height;
+    try {
+      window.localStorage.setItem(storageKey, String(Math.round(h)));
+    } catch (_) {}
+  };
+
+  splitter.addEventListener("pointerup", endDrag);
+  splitter.addEventListener("pointercancel", endDrag);
+
+  window.addEventListener("resize", () => {
+    const flex = String(tagWrap.style.flex || "");
+    const m = flex.match(/0\s+0\s+(\d+)px/);
+    if (!m) return;
+    const px = Number(m[1]);
+    if (!Number.isFinite(px)) return;
+    clampAndApply(px);
+  });
+}
+
+let _segmentMenuEl = null;
+let _fileMenuEl = null;
+let _renameMenuEl = null;
+let _fileMenuSuppressCloseUntil = 0;
+
+function _hideSegmentMenu() {
+  if (!_segmentMenuEl) return;
+  _segmentMenuEl.style.display = "none";
+}
+
+function _hideFileMenu() {
+  if (!_fileMenuEl) return;
+  _fileMenuEl.style.display = "none";
+}
+
+function _hideRenameMenu() {
+  if (!_renameMenuEl) return;
+  _renameMenuEl.style.display = "none";
+}
+
+function _ensureSegmentMenuEl() {
+  if (_segmentMenuEl) return _segmentMenuEl;
+  const el = document.createElement("div");
+  el.id = "segmentContextMenu";
+  el.className = "context-menu";
+  el.style.display = "none";
+  document.body.appendChild(el);
+  _segmentMenuEl = el;
+
+  document.addEventListener(
+    "click",
+    (e) => {
+      if (!_segmentMenuEl || _segmentMenuEl.style.display === "none") return;
+      if (_segmentMenuEl.contains(e.target)) return;
+      _hideSegmentMenu();
+    },
+    true
+  );
+
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (e.key === "Escape") {
+        _hideSegmentMenu();
+      }
+    },
+    true
+  );
+
+  window.addEventListener(
+    "scroll",
+    () => {
+      _hideSegmentMenu();
+    },
+    true
+  );
+
+  window.addEventListener(
+    "resize",
+    () => {
+      _hideSegmentMenu();
+    },
+    true
+  );
+
+  return el;
+}
+
+function _ensureRenameMenuEl() {
+  if (_renameMenuEl) return _renameMenuEl;
+  const el = document.createElement("div");
+  el.id = "renameContextMenu";
+  el.className = "context-menu";
+  el.style.display = "none";
+  document.body.appendChild(el);
+  _renameMenuEl = el;
+
+  document.addEventListener(
+    "click",
+    (e) => {
+      if (!_renameMenuEl || _renameMenuEl.style.display === "none") return;
+      if (_renameMenuEl.contains(e.target)) return;
+      _hideRenameMenu();
+    },
+    true
+  );
+
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (e.key === "Escape") {
+        _hideRenameMenu();
+      }
+    },
+    true
+  );
+
+  window.addEventListener(
+    "scroll",
+    () => {
+      _hideRenameMenu();
+    },
+    true
+  );
+
+  window.addEventListener(
+    "resize",
+    () => {
+      _hideRenameMenu();
+    },
+    true
+  );
+
+  return el;
+}
+
+function _placeMenuAt(el, clientX, clientY) {
+  if (!el) return;
+  el.style.left = `${clientX}px`;
+  el.style.top = `${clientY}px`;
+  el.style.display = "block";
+
+  window.requestAnimationFrame(() => {
+    if (el.style.display === "none") return;
+    const w = el.offsetWidth || 0;
+    const h = el.offsetHeight || 0;
+    const pad = 8;
+    const maxX = Math.max(pad, window.innerWidth - w - pad);
+    const maxY = Math.max(pad, window.innerHeight - h - pad);
+    const x = Math.max(pad, Math.min(clientX, maxX));
+    const y = Math.max(pad, Math.min(clientY, maxY));
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+  });
+}
+
+function _ensureFileMenuEl() {
+  if (_fileMenuEl) return _fileMenuEl;
+  const el = document.createElement("div");
+  el.id = "fileContextMenu";
+  el.className = "context-menu";
+  el.style.display = "none";
+  document.body.appendChild(el);
+  _fileMenuEl = el;
+
+  el.addEventListener("mousedown", (e) => {
+    e.stopPropagation();
+  });
+
+  el.addEventListener("click", (e) => {
+    e.stopPropagation();
+  });
+
+  document.addEventListener(
+    "click",
+    (e) => {
+      if (!_fileMenuEl || _fileMenuEl.style.display === "none") return;
+      if (Date.now() < _fileMenuSuppressCloseUntil) return;
+      if (_fileMenuEl.contains(e.target)) return;
+      _hideFileMenu();
+    },
+    true
+  );
+
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (e.key === "Escape") {
+        _hideFileMenu();
+      }
+    },
+    true
+  );
+
+  window.addEventListener(
+    "scroll",
+    () => {
+      _hideFileMenu();
+    },
+    true
+  );
+
+  window.addEventListener(
+    "resize",
+    () => {
+      _hideFileMenu();
+    },
+    true
+  );
+
+  return el;
+}
+
+function _showFileMenuAt(clientX, clientY, relpath, displayName) {
+  const rp = String(relpath || "");
+  if (!rp) return;
+
+  _hideRenameMenu();
+  _hideSegmentMenu();
+
+  _fileMenuSuppressCloseUntil = Date.now() + 250;
+
+  const el = _ensureFileMenuEl();
+  const label = String(displayName || filenameFromRelpath(rp) || rp);
+  el.innerHTML = "";
+
+  const title = document.createElement("div");
+  title.className = "context-menu-title";
+  title.textContent = label;
+  el.appendChild(title);
+
+  const btnRename = document.createElement("button");
+  btnRename.type = "button";
+  btnRename.className = "context-menu-item";
+  btnRename.textContent = "Umbenennen";
+  const doRename = (e) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    const input = window.prompt("Neuer Dateiname (ohne Pfad):", label);
+    if (input === null) return;
+    const newName = String(input || "").trim();
+    if (!newName) return;
+    _hideFileMenu();
+    renameSourceVideoFile(rp, newName);
+  };
+  btnRename.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    doRename(e);
+  });
+  btnRename.addEventListener("click", doRename);
+  el.appendChild(btnRename);
+
+  const btnDelete = document.createElement("button");
+  btnDelete.type = "button";
+  btnDelete.className = "context-menu-item";
+  btnDelete.textContent = "Löschen";
+  const doDelete = async (e) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    _hideFileMenu();
+    await deleteSourceVideoFile(rp, label);
+  };
+  btnDelete.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    doDelete(e);
+  });
+  btnDelete.addEventListener("click", doDelete);
+  el.appendChild(btnDelete);
+
+  _placeMenuAt(el, clientX, clientY);
+}
+
+function _renderFileRenameInline(menuEl, clientX, clientY, relpath, displayName) {
+  const rp = String(relpath || "");
+  if (!rp) return;
+  const el = menuEl || _ensureFileMenuEl();
+  const currentName = String(displayName || filenameFromRelpath(rp) || rp);
+
+  _fileMenuSuppressCloseUntil = Date.now() + 250;
+
+  el.innerHTML = "";
+
+  const title = document.createElement("div");
+  title.className = "context-menu-title";
+  title.textContent = "Neuer Dateiname";
+  el.appendChild(title);
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.id = "renameInput";
+  input.name = "rename";
+  input.autocomplete = "off";
+  input.className = "input";
+  input.value = currentName;
+  input.style.width = "280px";
+  el.appendChild(input);
+
+  const btnOk = document.createElement("button");
+  btnOk.type = "button";
+  btnOk.className = "context-menu-item";
+  btnOk.textContent = "OK";
+  const doOk = async (e) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    const newName = String(input.value || "").trim();
+    if (!newName) return;
+    _hideFileMenu();
+    await renameSourceVideoFile(rp, newName);
+  };
+  btnOk.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    doOk(e);
+  });
+  btnOk.addEventListener("click", doOk);
+  el.appendChild(btnOk);
+
+  const btnCancel = document.createElement("button");
+  btnCancel.type = "button";
+  btnCancel.className = "context-menu-item";
+  btnCancel.textContent = "Abbrechen";
+  const doCancel = (e) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    _hideFileMenu();
+  };
+  btnCancel.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    doCancel(e);
+  });
+  btnCancel.addEventListener("click", doCancel);
+  el.appendChild(btnCancel);
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      btnOk.click();
+    } else if (e.key === "Escape") {
+      _hideFileMenu();
+    }
+  });
+
+  _placeMenuAt(el, clientX, clientY);
+  window.requestAnimationFrame(() => {
+    try {
+      input.focus();
+      input.select();
+    } catch (_) {}
+  });
+}
+
+function _showRenameMenuAt(clientX, clientY, relpath, displayName) {
+  const rp = String(relpath || "");
+  if (!rp) return;
+  const el = _ensureRenameMenuEl();
+  const currentName = String(displayName || filenameFromRelpath(rp) || rp);
+
+  el.innerHTML = "";
+  const title = document.createElement("div");
+  title.className = "context-menu-title";
+  title.textContent = "Neuer Dateiname";
+  el.appendChild(title);
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.id = "renameInput";
+  input.name = "rename";
+  input.autocomplete = "off";
+  input.className = "input";
+  input.value = currentName;
+  input.style.width = "280px";
+  el.appendChild(input);
+
+  const btnOk = document.createElement("button");
+  btnOk.type = "button";
+  btnOk.className = "context-menu-item";
+  btnOk.textContent = "OK";
+  btnOk.addEventListener("click", async () => {
+    const newName = String(input.value || "").trim();
+    if (!newName) return;
+    _hideRenameMenu();
+    await renameSourceVideoFile(rp, newName);
+  });
+  el.appendChild(btnOk);
+
+  const btnCancel = document.createElement("button");
+  btnCancel.type = "button";
+  btnCancel.className = "context-menu-item";
+  btnCancel.textContent = "Abbrechen";
+  btnCancel.addEventListener("click", () => {
+    _hideRenameMenu();
+  });
+  el.appendChild(btnCancel);
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      btnOk.click();
+    } else if (e.key === "Escape") {
+      _hideRenameMenu();
+    }
+  });
+
+  _placeMenuAt(el, clientX, clientY);
+  window.requestAnimationFrame(() => {
+    try {
+      input.focus();
+      input.select();
+    } catch (_) {}
+  });
+}
+
+function _deleteSegmentByEndMarker(endTime) {
+  const end = Number(endTime);
+  if (!Number.isFinite(end)) return;
+  state.clipMarkers = (state.clipMarkers || []).filter((m) => Math.abs(Number(m) - end) >= 0.05);
+  refreshClipEditorForCurrentVideo();
+}
+
+function _showSegmentMenuAt(clientX, clientY, segment) {
+  const player = $("videoPlayer");
+  if (!player) return;
+  if (!segment || !Number.isFinite(segment.start) || !Number.isFinite(segment.end)) return;
+
+  const el = _ensureSegmentMenuEl();
+  const label = `${formatTime(segment.start)} → ${formatTime(segment.end)}`;
+  el.innerHTML = "";
+
+  const title = document.createElement("div");
+  title.className = "context-menu-title";
+  title.textContent = label;
+  el.appendChild(title);
+
+  const btnCreate = document.createElement("button");
+  btnCreate.type = "button";
+  btnCreate.className = "context-menu-item";
+  btnCreate.textContent = "Segment erstellen";
+  btnCreate.addEventListener("click", async () => {
+    _hideSegmentMenu();
+    await createClipsForSegments([{ start: segment.start, end: segment.end }]);
+  });
+  el.appendChild(btnCreate);
+
+  const btnDelete = document.createElement("button");
+  btnDelete.type = "button";
+  btnDelete.className = "context-menu-item";
+  btnDelete.textContent = "Segment löschen";
+  btnDelete.addEventListener("click", () => {
+    _hideSegmentMenu();
+    _deleteSegmentByEndMarker(segment.end);
+  });
+  el.appendChild(btnDelete);
+
+  el.style.display = "block";
+
+  const padding = 8;
+  const w = el.offsetWidth || 200;
+  const h = el.offsetHeight || 90;
+  let x = clientX;
+  let y = clientY;
+  if (x + w + padding > window.innerWidth) x = window.innerWidth - w - padding;
+  if (y + h + padding > window.innerHeight) y = window.innerHeight - h - padding;
+  x = Math.max(padding, x);
+  y = Math.max(padding, y);
+  el.style.left = `${x}px`;
+  el.style.top = `${y}px`;
+}
+
+function renderMarkerTimeline() {
+  const tl = $("markerTimeline");
+  const player = $("videoPlayer");
+  if (!tl || !player) return;
+
+  const duration = Number(player.duration);
+  tl.innerHTML = "";
+
+  if (!state.currentVideo || state.currentVideo.kind !== "source") {
+    const hint = document.createElement("div");
+    hint.className = "hint";
+    hint.textContent = "Kein Video gewählt.";
+    tl.appendChild(hint);
+    return;
+  }
+
+  if (!Number.isFinite(duration) || duration <= 0) {
+    const hint = document.createElement("div");
+    hint.className = "hint";
+    hint.textContent = "Lade Metadaten…";
+    tl.appendChild(hint);
+    return;
+  }
+
+  const segs = computeSegmentsFromMarkers(state.clipMarkers || []);
+  const colors = [
+    "rgba(74, 222, 128, 0.55)",
+    "rgba(110, 168, 254, 0.55)",
+    "rgba(255, 107, 107, 0.55)",
+    "rgba(246, 193, 71, 0.55)",
+  ];
+
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    const left = (s.start / duration) * 100;
+    const width = ((s.end - s.start) / duration) * 100;
+    const seg = document.createElement("div");
+    seg.className = "seg";
+    seg.style.left = `${left}%`;
+    seg.style.width = `${width}%`;
+    seg.style.background = colors[i % colors.length];
+    const label = `${formatTime(s.start)} → ${formatTime(s.end)}`;
+    seg.title = label;
+    const span = document.createElement("span");
+    span.className = "seg-label";
+    span.textContent = label;
+    seg.appendChild(span);
+
+    seg.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      _showSegmentMenuAt(e.clientX, e.clientY, s);
+    });
+
+    tl.appendChild(seg);
+  }
+
+  const markers = _sortedUniqueMarkers(state.clipMarkers || []);
+  for (const t of markers) {
+    const x = (t / duration) * 100;
+    const tick = document.createElement("div");
+    tick.className = "tick";
+    tick.style.left = `calc(${x}% - 1px)`;
+    tick.title = `Marker ${formatTime(t)} (Alt+Klick: löschen)`;
+    tick.dataset.t = String(t);
+
+    tick.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const tt = Number(tick.dataset.t);
+      if (!Number.isFinite(tt)) return;
+
+      if (e.altKey) {
+        state.clipMarkers = (state.clipMarkers || []).filter((m) => Math.abs(Number(m) - tt) >= 0.05);
+        refreshClipEditorForCurrentVideo();
+        return;
+      }
+
+      player.currentTime = tt;
+      player.play().catch(() => {});
+      renderMarkerTimeline();
+    });
+
+    tl.appendChild(tick);
+  }
+
+  const playhead = document.createElement("div");
+  playhead.className = "playhead";
+  const ct = Math.max(0, Math.min(duration, Number(player.currentTime || 0)));
+  playhead.style.left = `calc(${(ct / duration) * 100}% - 1px)`;
+  tl.appendChild(playhead);
+
+  tl.title = "Klick: springen | Shift+Klick: Marker bei aktueller Zeit | Alt+Klick Marker: löschen";
+}
+
+function setupMarkerTimelineUI() {
+  const tl = $("markerTimeline");
+  const player = $("videoPlayer");
+  if (!tl || !player) return;
+
+  tl.addEventListener("click", (e) => {
+    if (!state.currentVideo || state.currentVideo.kind !== "source") return;
+
+    const duration = Number(player.duration);
+    if (!Number.isFinite(duration) || duration <= 0) return;
+
+    if (e.shiftKey) {
+      addMarkerAtTime(Number(player.currentTime || 0));
+      return;
+    }
+
+    const r = tl.getBoundingClientRect();
+    const x = Math.max(0, Math.min(r.width, e.clientX - r.left));
+    const t = (x / r.width) * duration;
+
+    player.currentTime = t;
+    player.play().catch(() => {});
+    renderMarkerTimeline();
+  });
+
+  player.addEventListener("timeupdate", () => {
+    renderMarkerTimeline();
+  });
+
+  player.addEventListener("loadedmetadata", () => {
+    renderMarkerTimeline();
+  });
+}
+
+function setupMarkerShortcut() {
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "m" && e.key !== "M") return;
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+    if (isTypingTarget(e.target)) return;
+    if (!state.currentVideo || state.currentVideo.kind !== "source") return;
+
+    const player = $("videoPlayer");
+    if (!player) return;
+    e.preventDefault();
+    addMarkerAtTime(Number(player.currentTime || 0));
+  });
+}
+
+function setupVideoShiftClickMarker() {
+  const player = $("videoPlayer");
+  if (!player) return;
+
+  player.addEventListener("pointerdown", (e) => {
+    if (!e.shiftKey) return;
+    if (e.button !== 0) return;
+    if (!state.currentVideo || state.currentVideo.kind !== "source") return;
+    if (isTypingTarget(e.target)) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    addMarkerAtTime(Number(player.currentTime || 0));
+  });
 }
 
 async function createClipsForSegments(segments) {
@@ -393,7 +1214,11 @@ function renderTagDropdown(tags) {
   opt0.textContent = "Tag auswählen…";
   sel.appendChild(opt0);
 
-  const items = tags || [];
+  const items = [...(tags || [])].sort((a, b) => {
+    const aa = String((a && a.tag) || "").toLowerCase();
+    const bb = String((b && b.tag) || "").toLowerCase();
+    return aa.localeCompare(bb, "de");
+  });
   for (const it of items) {
     const opt = document.createElement("option");
     opt.value = it.tag;
@@ -472,7 +1297,7 @@ function renderResults(kind, results) {
         <span class="badge">${kind === "name" ? "NAME" : "TAG"}</span>
         <div class="name">${escapeHtml(r.name)}</div>
       </div>
-      <div class="mono" style="font-size:11px; color: var(--muted); max-width: 45%; overflow:hidden; text-overflow: ellipsis; white-space: nowrap;">
+      <div class="mono" style="font-size:11px; color: var(--muted); max-width: 55%; overflow:hidden; text-overflow: ellipsis; white-space: nowrap;">
         ${escapeHtml(r.relpath)}
       </div>
     `;
@@ -482,6 +1307,8 @@ function renderResults(kind, results) {
       e.dataTransfer.setData("application/x-video-drag", JSON.stringify({ kind: "source", relpath: r.relpath }));
       e.dataTransfer.effectAllowed = "copyMove";
     });
+
+    bindFileContextMenu(row, r.relpath, r.name);
 
     const nameEl = row.querySelector(".name");
     if (nameEl) {
@@ -623,8 +1450,7 @@ function setupClipEditorUI() {
       if (!player) return;
       const t = Number(player.currentTime || 0);
       if (!Number.isFinite(t) || t < 0) return;
-      state.clipMarkers = _sortedUniqueMarkers([...(state.clipMarkers || []), t]);
-      refreshClipEditorForCurrentVideo();
+      addMarkerAtTime(t);
     });
   }
 
@@ -668,6 +1494,79 @@ function setupQueueControls() {
       setStatus("Queue geleert.", "ok");
     } catch (e) {
       setStatus(e.message, "error");
+    }
+  });
+}
+
+function setMergeProgress({ visible, pct = 0, text = "" }) {
+  const wrap = $("mergeProgressWrap");
+  const bar = $("mergeProgressBar");
+  const t = $("mergeProgressText");
+  if (wrap) wrap.style.display = visible ? "block" : "none";
+  if (bar) bar.style.width = `${Math.max(0, Math.min(100, Number(pct) || 0))}%`;
+  if (t) t.textContent = text || "";
+}
+
+async function startMergeDownload() {
+  const btn = $("mergeDownloadBtn");
+  if (btn) btn.disabled = true;
+  setMergeProgress({ visible: true, pct: 0, text: "Starte Merge…" });
+
+  try {
+    const resp = await apiPost("/api/merge/start", {});
+    const jobId = resp && resp.job_id;
+    if (!jobId) {
+      throw new Error("Merge-Job konnte nicht gestartet werden.");
+    }
+
+    const start = Date.now();
+    while (true) {
+      const st = await apiGet(`/api/merge/status?job_id=${encodeURIComponent(jobId)}`);
+      const pct = Number(st.progress_pct || 0);
+      const phase = st.phase || "";
+      const msg = st.message || "";
+      setMergeProgress({ visible: true, pct, text: `${phase}${msg ? ": " + msg : ""}` });
+
+      if (st.status === "done") {
+        if (st.download_ready) {
+          setMergeProgress({ visible: true, pct: 100, text: "Fertig. Download startet…" });
+          window.location.href = `/api/merge/download/${encodeURIComponent(jobId)}`;
+          break;
+        }
+        setMergeProgress({ visible: true, pct: 99, text: "Finalisiere Ausgabe…" });
+      }
+      if (st.status === "error") {
+        throw new Error(st.error || "Merge fehlgeschlagen.");
+      }
+      if (Date.now() - start > 1000 * 60 * 60) {
+        throw new Error("Timeout beim Merge.");
+      }
+      await new Promise((r) => setTimeout(r, 700));
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+    window.setTimeout(() => setMergeProgress({ visible: false, pct: 0, text: "" }), 2500);
+  }
+}
+
+function setupMergeDownloadUI() {
+  const btn = $("mergeDownloadBtn");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    try {
+      await loadQueue();
+      if (!state.queue || state.queue.length === 0) {
+        setStatus("Queue ist leer.", "error");
+        return;
+      }
+      if (!window.confirm(`Alle Videos in der Queue (${state.queue.length}) zu einem Video mergen und downloaden?`)) {
+        return;
+      }
+      await startMergeDownload();
+    } catch (e) {
+      setStatus(e.message, "error");
+      setMergeProgress({ visible: false, pct: 0, text: "" });
+      if (btn) btn.disabled = false;
     }
   });
 }
@@ -719,14 +1618,6 @@ function navigateList(path, { replace = false } = {}) {
   loadList(p);
 }
 
-function getTransferMode() {
-  const radios = document.querySelectorAll('input[name="transferMode"]');
-  for (const r of radios) {
-    if (r.checked) return r.value;
-  }
-  return "copy";
-}
-
 function getTagMode() {
   const radios = document.querySelectorAll('input[name="tagMode"]');
   for (const r of radios) {
@@ -770,6 +1661,50 @@ async function apiDelete(url) {
     throw new Error(msg);
   }
   return data;
+}
+
+async function deleteSourceVideoFile(relpath, displayName) {
+  const rp = String(relpath || "");
+  if (!rp) return;
+  const name = String(displayName || filenameFromRelpath(rp) || rp);
+  const ok = window.confirm(`Datei wirklich löschen?\n\n${name}`);
+  if (!ok) return;
+
+  try {
+    await apiPost("/api/files/delete", { relpath: rp });
+
+    if (state.currentVideo && state.currentVideo.kind === "source" && state.currentVideo.relpath === rp) {
+      const player = $("videoPlayer");
+      if (player) {
+        try {
+          player.pause();
+        } catch (_) {}
+        player.removeAttribute("src");
+        player.load();
+      }
+      state.currentVideo = null;
+      refreshTagEditorForCurrentVideo();
+      refreshClipEditorForCurrentVideo();
+    }
+
+    if (Array.isArray(state.tagResults) && state.tagResults.length > 0) {
+      const before = state.tagResults.length;
+      state.tagResults = state.tagResults.filter((r) => r && r.relpath !== rp);
+      if (state.tagResults.length !== before) {
+        renderResults(state.lastResultsKind || "tag", state.tagResults);
+      }
+    }
+
+    await loadList(state.currentPath);
+    await loadTagIndex({ refresh: true });
+    await waitForTagIndexReady({ maxMs: 60000 });
+    updateTagSuggestions();
+    updateActivePlayingHighlights();
+
+    setStatus("Datei gelöscht.", "ok");
+  } catch (e) {
+    setStatus(e.message, "error");
+  }
 }
 
 function escapeHtml(s) {
@@ -896,6 +1831,8 @@ function renderFolders(listData) {
       e.dataTransfer.setData("text/plain", v.relpath);
       e.dataTransfer.effectAllowed = "copyMove";
     });
+
+    bindFileContextMenu(row, v.relpath, v.name);
 
     const nameEl = row.querySelector(".name");
     if (nameEl) {
@@ -1265,115 +2202,18 @@ function setupDropZone() {
   ql.addEventListener("drop", onDropToQueue);
 }
 
-function renderExportBreadcrumb(p) {
-  $("exportBreadcrumb").textContent = p || "/";
-}
-
-function renderExportFolders(listData) {
-  const el = $("exportFolderList");
-  el.innerHTML = "";
-
-  const folders = listData.folders || [];
-
-  if (listData.parent_path !== null && listData.parent_path !== undefined) {
-    const rowUp = document.createElement("div");
-    rowUp.className = "item";
-    rowUp.innerHTML = `
-      <div class="item-left">
-        <span class="badge">UP</span>
-        <div class="name">..</div>
-      </div>
-      <div></div>
-    `;
-    rowUp.addEventListener("dblclick", () => {
-      loadExportList(listData.parent_path || "");
-    });
-    el.appendChild(rowUp);
-  }
-
-  for (const f of folders) {
-    const row = document.createElement("div");
-    row.className = "item";
-    row.innerHTML = `
-      <div class="item-left">
-        <span class="badge">DIR</span>
-        <div class="name">${escapeHtml(f.name)}</div>
-      </div>
-      <div></div>
-    `;
-
-    row.addEventListener("dblclick", () => {
-      loadExportList(f.relpath);
-    });
-
-    el.appendChild(row);
-  }
-}
-
-async function loadExportList(path) {
-  const rel = path || "";
-  try {
-    const data = await apiGet(`/api/export/list?path=${encodeURIComponent(rel)}`);
-    state.exportPath = data.current_path || "";
-    state.exportList = data;
-    renderExportBreadcrumb(state.exportPath);
-    renderExportFolders(data);
-
-  } catch (e) {
-    setStatus(e.message, "error");
-  }
-}
-
-function setupExportUI() {
-  $("exportMkdir").addEventListener("click", async () => {
-    const name = $("newExportFolder").value || "";
-    if (name.trim() === "") {
-      setStatus("Bitte Ordnername eingeben.", "error");
-      return;
-    }
-
-    try {
-      await apiPost("/api/export/mkdir", { parent_path: state.exportPath, folder_name: name.trim() });
-      $("newExportFolder").value = "";
-      await loadExportList(state.exportPath);
-      setStatus("Ordner angelegt.", "ok");
-    } catch (e) {
-      setStatus(e.message, "error");
-    }
-  });
-
-  $("exportRun").addEventListener("click", async () => {
-    try {
-      let resp;
-      try {
-        resp = await apiPost("/api/export/run", { destination_subdir: state.exportPath, clear_destination: false });
-      } catch (e) {
-        if (e.status === 409 && e.data && e.data.code === "destination_not_empty") {
-          const ok = window.confirm("Export-Zielordner ist nicht leer. Vorher leeren?");
-          if (!ok) return;
-          resp = await apiPost("/api/export/run", { destination_subdir: state.exportPath, clear_destination: true });
-        } else {
-          throw e;
-        }
-      }
-      if (resp.skipped_count > 0) {
-        setStatus(`Export fertig: ${resp.exported_count} kopiert, ${resp.skipped_count} übersprungen.`, "error");
-      } else {
-        setStatus(`Export fertig: ${resp.exported_count} kopiert.`, "ok");
-      }
-    } catch (e) {
-      setStatus(e.message, "error");
-    }
-  });
-}
-
 async function main() {
+  setupGlobalFileContextMenu();
+  setupBrowserListSplitter();
   setupDropZone();
   setupQueueControls();
+  setupMergeDownloadUI();
   setupTagSearchUI();
   setupTagEditorUI();
   setupClipEditorUI();
-  setupExportUI();
+  setupMarkerTimelineUI();
+  setupMarkerShortcut();
+  setupVideoShiftClickMarker();
   setupVideoPlayerDiagnostics();
 
   const initialPath = getInitialBrowserPath();
@@ -1386,7 +2226,6 @@ async function main() {
 
   await loadList(initialPath);
   await loadQueue();
-  await loadExportList("");
   renderTagResults([]);
   await loadTagIndex({ refresh: false });
   await waitForTagIndexReady({ maxMs: 60000 });
