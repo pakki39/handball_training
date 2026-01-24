@@ -11,6 +11,7 @@ import math
 import uuid
 import tempfile
 import json
+import hashlib
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template, request, send_file, g, Response
@@ -218,6 +219,9 @@ _TAG_INDEX_LAST_ERROR = None
 
 
 _MERGE_JOBS = {}
+
+_DEDUPE_SCANS = {}
+_DEDUPE_SCANS_LOCK = threading.Lock()
 _MERGE_JOBS_LOCK = threading.Lock()
 
 
@@ -709,9 +713,359 @@ def _unique_destination_filename(dest_dir_abs: str, filename: str):
     return candidate
 
 
-@app.route("/")
+def _sha256_file(abs_path: str) -> str:
+    h = hashlib.sha256()
+    with open(abs_path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _dedupe_list_dirs_under_video_root() -> list[str]:
+    root_abs = os.path.abspath(app.config["VIDEO_ROOT"])
+    out = [""]
+    for dirpath, dirnames, _filenames in os.walk(root_abs):
+        rel = os.path.relpath(dirpath, root_abs)
+        if rel == ".":
+            rel_norm = ""
+        else:
+            rel_norm = _normalize_relpath(rel)
+            if rel_norm.lower() == "dubletten" or rel_norm.lower().startswith("dubletten/"):
+                dirnames[:] = []
+                continue
+            out.append(rel_norm)
+
+        keep = []
+        for d in dirnames:
+            if d.startswith("."):
+                continue
+            if d.lower() == "dubletten" and rel_norm == "":
+                continue
+            keep.append(d)
+        dirnames[:] = keep
+
+    out = sorted(set(out), key=lambda x: (x.count("/"), x.lower()))
+    return out
+
+
+def _dedupe_scan_dir(dir_abs: str, dir_norm: str) -> list[dict]:
+    size_map: dict[int, list[str]] = {}
+
+    for dirpath, dirnames, filenames in os.walk(dir_abs):
+        rel_dir = os.path.relpath(dirpath, dir_abs)
+        if rel_dir == ".":
+            rel_dir_norm = dir_norm
+        else:
+            rel_dir_norm = _normalize_relpath(rel_dir)
+            rel_dir_norm = rel_dir_norm if dir_norm == "" else f"{dir_norm}/{rel_dir_norm}"
+
+        keep_dirs = []
+        for d in dirnames:
+            if d.startswith("."):
+                continue
+            child_rel = d if rel_dir_norm == "" else f"{rel_dir_norm}/{d}"
+            if child_rel.lower() == "dubletten" or child_rel.lower().startswith("dubletten/"):
+                continue
+            keep_dirs.append(d)
+        dirnames[:] = keep_dirs
+
+        for fn in filenames:
+            if fn.startswith("."):
+                continue
+            if not _is_allowed_video_filename(fn):
+                continue
+            relpath = fn if rel_dir_norm == "" else f"{rel_dir_norm}/{fn}"
+            abs_path = os.path.join(dirpath, fn)
+            try:
+                size = os.path.getsize(abs_path)
+            except Exception:
+                continue
+            size_map.setdefault(int(size), []).append(_normalize_relpath(relpath))
+
+    groups: list[dict] = []
+    for size, relpaths in size_map.items():
+        if len(relpaths) < 2:
+            continue
+
+        hash_map: dict[str, list[str]] = {}
+        for rp in relpaths:
+            try:
+                abs_path, _ = _safe_abs_path(app.config["VIDEO_ROOT"], rp)
+                if not os.path.isfile(abs_path):
+                    continue
+                sha = _sha256_file(abs_path)
+                hash_map.setdefault(sha, []).append(rp)
+            except Exception:
+                continue
+
+        for sha, files in hash_map.items():
+            if len(files) < 2:
+                continue
+            files_sorted = sorted(files)
+            keep = _dedupe_choose_keep(files_sorted)
+            group_id = f"{size}:{sha}"
+            groups.append(
+                {
+                    "group_id": group_id,
+                    "sha256": sha,
+                    "size_bytes": size,
+                    "keep": keep,
+                    "files": files_sorted,
+                }
+            )
+
+    groups.sort(key=lambda g: (-len(g.get("files", [])), g.get("size_bytes", 0), g.get("sha256", "")))
+    return groups
+
+
+def _dedupe_choose_keep(files: list[str]) -> str:
+    if not files:
+        return ""
+    return sorted(
+        files,
+        key=lambda rp: (-len(os.path.basename(rp)), os.path.basename(rp).lower(), rp.lower()),
+    )[0]
+
+
+def _dedupe_scan_update(scan_id: str, **fields):
+    with _DEDUPE_SCANS_LOCK:
+        st = _DEDUPE_SCANS.get(scan_id)
+        if not st:
+            return
+        for k, v in fields.items():
+            st[k] = v
+        st["updated_at"] = _utc_now_iso()
+        _DEDUPE_SCANS[scan_id] = st
+
+
+def _dedupe_scan_log(scan_id: str, message: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {message}"
+    with _DEDUPE_SCANS_LOCK:
+        st = _DEDUPE_SCANS.get(scan_id)
+        if not st:
+            return
+        logs = st.get("log")
+        if not isinstance(logs, list):
+            logs = []
+        logs.append(line)
+        if len(logs) > 200:
+            logs = logs[-200:]
+        st["log"] = logs
+        st["updated_at"] = _utc_now_iso()
+        _DEDUPE_SCANS[scan_id] = st
+
+
+def _start_dedupe_scan_job(dir_abs: str, dir_norm: str) -> str:
+    scan_id = str(uuid.uuid4())
+    scan_state = {
+        "scan_id": scan_id,
+        "root": dir_norm,
+        "created_at": _utc_now_iso(),
+        "updated_at": _utc_now_iso(),
+        "status": "running",
+        "phase": "Start",
+        "message": "Initialisiere…",
+        "progress": {
+            "dirs": 0,
+            "files_total": 0,
+            "video_files": 0,
+            "candidate_files": 0,
+            "hashed_files": 0,
+            "duplicate_groups": 0,
+            "duplicate_files": 0,
+        },
+        "groups": [],
+        "error": None,
+        "log": [],
+    }
+    with _DEDUPE_SCANS_LOCK:
+        _DEDUPE_SCANS[scan_id] = scan_state
+
+    def _worker():
+        with app.app_context():
+            try:
+                _dedupe_scan_log(scan_id, f"Start Scan in '{dir_norm or '/'}'.")
+                _dedupe_scan_update(scan_id, phase="Scan", message="Dateien sammeln…")
+
+                size_map: dict[int, list[tuple[str, str]]] = {}
+                dirs = 0
+                files_total = 0
+                video_files = 0
+
+                for walk_dirpath, dirnames, filenames in os.walk(dir_abs):
+                    dirs += 1
+
+                    rel_dir = os.path.relpath(walk_dirpath, dir_abs)
+                    if rel_dir == ".":
+                        rel_dir_norm = dir_norm
+                    else:
+                        rel_dir_norm = _normalize_relpath(rel_dir)
+                        rel_dir_norm = rel_dir_norm if dir_norm == "" else f"{dir_norm}/{rel_dir_norm}"
+
+                    keep_dirs = []
+                    for d in dirnames:
+                        if d.startswith("."):
+                            continue
+                        child_rel = d if rel_dir_norm == "" else f"{rel_dir_norm}/{d}"
+                        if child_rel.lower() == "dubletten" or child_rel.lower().startswith("dubletten/"):
+                            continue
+                        keep_dirs.append(d)
+                    dirnames[:] = keep_dirs
+
+                    for fn in filenames:
+                        if fn.startswith("."):
+                            continue
+                        files_total += 1
+                        if not _is_allowed_video_filename(fn):
+                            continue
+                        video_files += 1
+                        relpath = fn if rel_dir_norm == "" else f"{rel_dir_norm}/{fn}"
+                        abs_path = os.path.join(walk_dirpath, fn)
+                        try:
+                            size = os.path.getsize(abs_path)
+                        except Exception:
+                            continue
+                        size_map.setdefault(int(size), []).append((abs_path, _normalize_relpath(relpath)))
+
+                    if dirs % 30 == 0:
+                        _dedupe_scan_update(
+                            scan_id,
+                            progress={
+                                "dirs": dirs,
+                                "files_total": files_total,
+                                "video_files": video_files,
+                                "candidate_files": 0,
+                                "hashed_files": 0,
+                                "duplicate_groups": 0,
+                                "duplicate_files": 0,
+                            },
+                            message=f"Dateien sammeln… ({video_files} Videos)",
+                        )
+
+                candidate_files = 0
+                for _size, entries in size_map.items():
+                    if len(entries) > 1:
+                        candidate_files += len(entries)
+
+                _dedupe_scan_log(scan_id, f"Gefunden: {video_files} Videos. Kandidaten (gleiche Größe): {candidate_files}.")
+                _dedupe_scan_update(
+                    scan_id,
+                    phase="Hash",
+                    message="Hashes berechnen…",
+                    progress={
+                        "dirs": dirs,
+                        "files_total": files_total,
+                        "video_files": video_files,
+                        "candidate_files": candidate_files,
+                        "hashed_files": 0,
+                        "duplicate_groups": 0,
+                        "duplicate_files": 0,
+                    },
+                )
+
+                hashed_files = 0
+                groups: list[dict] = []
+                dup_files = 0
+                dup_groups = 0
+
+                for size, entries in size_map.items():
+                    if len(entries) < 2:
+                        continue
+                    hash_map: dict[str, list[str]] = {}
+                    for abs_path, rp in entries:
+                        try:
+                            if not os.path.isfile(abs_path):
+                                continue
+                            sha = _sha256_file(abs_path)
+                            hash_map.setdefault(sha, []).append(rp)
+                        except Exception:
+                            continue
+                        hashed_files += 1
+                        if hashed_files % 5 == 0 or hashed_files == candidate_files:
+                            _dedupe_scan_update(
+                                scan_id,
+                                progress={
+                                    "dirs": dirs,
+                                    "files_total": files_total,
+                                    "video_files": video_files,
+                                    "candidate_files": candidate_files,
+                                    "hashed_files": hashed_files,
+                                    "duplicate_groups": dup_groups,
+                                    "duplicate_files": dup_files,
+                                },
+                                message=f"Hashes berechnen… ({hashed_files}/{candidate_files})",
+                            )
+
+                    for sha, files in hash_map.items():
+                        if len(files) < 2:
+                            continue
+                        files_sorted = sorted(files)
+                        keep = _dedupe_choose_keep(files_sorted)
+                        group_id = f"{size}:{sha}"
+                        groups.append(
+                            {
+                                "group_id": group_id,
+                                "sha256": sha,
+                                "size_bytes": size,
+                                "keep": keep,
+                                "files": files_sorted,
+                            }
+                        )
+                        dup_groups += 1
+                        dup_files += max(0, len(files_sorted) - 1)
+                        _dedupe_scan_log(scan_id, f"Dubletten: {len(files_sorted)} Dateien (Größe {size} B)")
+
+                groups.sort(key=lambda g: (-len(g.get("files", [])), g.get("size_bytes", 0), g.get("sha256", "")))
+
+                _dedupe_scan_update(
+                    scan_id,
+                    status="done",
+                    phase="Done",
+                    message=f"Fertig. Gruppen: {len(groups)} | Duplikate: {dup_files}",
+                    groups=groups,
+                    progress={
+                        "dirs": dirs,
+                        "files_total": files_total,
+                        "video_files": video_files,
+                        "candidate_files": candidate_files,
+                        "hashed_files": hashed_files,
+                        "duplicate_groups": dup_groups,
+                        "duplicate_files": dup_files,
+                    },
+                )
+                _dedupe_scan_log(scan_id, "Scan abgeschlossen.")
+            except Exception as e:
+                _dedupe_scan_update(scan_id, status="error", phase="Error", message="Scan fehlgeschlagen.", error=str(e))
+                _dedupe_scan_log(scan_id, f"FEHLER: {e}")
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return scan_id
+
+
+@app.route("/", methods=["GET"])
 def index():
     return render_template("index.html")
+
+
+@app.route("/api/config", methods=["GET"])
+def api_config():
+    try:
+        return jsonify(
+            {
+                "ok": True,
+                "video_root": app.config.get("VIDEO_ROOT"),
+                "video_root_env": os.environ.get("VIDEO_ROOT"),
+                "tag_scan_root": app.config.get("TAG_SCAN_ROOT"),
+                "tag_scan_root_env": os.environ.get("TAG_SCAN_ROOT"),
+            }
+        )
+    except Exception:
+        return _json_error("Config konnte nicht geladen werden.", 500, code="server_error")
 
 
 @app.route("/api/list", methods=["GET"])
@@ -724,6 +1078,144 @@ def api_list():
         return _json_error("Ungültiger Pfad.", 400, code="invalid_path")
     except FileNotFoundError:
         return _json_error("Ordner nicht gefunden.", 404, code="not_found")
+
+
+@app.route("/api/dedupe/dirs", methods=["GET"])
+def api_dedupe_dirs():
+    try:
+        dirs = _dedupe_list_dirs_under_video_root()
+        return jsonify({"ok": True, "dirs": dirs})
+    except Exception:
+        return _json_error("Verzeichnisliste konnte nicht geladen werden.", 500, code="server_error")
+
+
+@app.route("/api/dedupe/scan", methods=["POST"])
+def api_dedupe_scan():
+    body = request.get_json(silent=True) or {}
+    dir_relpath = body.get("dir_relpath", "")
+    if dir_relpath is None:
+        dir_relpath = ""
+    if not isinstance(dir_relpath, str):
+        return _json_error("dir_relpath muss string sein.", 400, code="bad_request")
+
+    try:
+        abs_dir, norm = _safe_abs_path(app.config["VIDEO_ROOT"], dir_relpath)
+        if not os.path.isdir(abs_dir):
+            return _json_error("Ordner nicht gefunden.", 404, code="not_found")
+
+        scan_id = _start_dedupe_scan_job(abs_dir, norm)
+        return jsonify({"ok": True, "scan_id": scan_id, "root": norm})
+    except ValueError:
+        return _json_error("Ungültiger Pfad.", 400, code="invalid_path")
+    except Exception:
+        return _json_error("Dubletten-Suche fehlgeschlagen.", 500, code="server_error")
+
+
+@app.route("/api/dedupe/scan/status/<scan_id>", methods=["GET"])
+def api_dedupe_scan_status(scan_id: str):
+    with _DEDUPE_SCANS_LOCK:
+        st = _DEDUPE_SCANS.get(scan_id)
+    if not st:
+        return _json_error("Scan nicht gefunden.", 404, code="not_found")
+
+    logs = st.get("log")
+    if not isinstance(logs, list):
+        logs = []
+
+    return jsonify(
+        {
+            "ok": True,
+            "scan_id": scan_id,
+            "root": st.get("root"),
+            "status": st.get("status"),
+            "phase": st.get("phase"),
+            "message": st.get("message"),
+            "progress": st.get("progress", {}),
+            "error": st.get("error"),
+            "updated_at": st.get("updated_at"),
+            "log_tail": logs[-60:],
+            "groups": st.get("groups", []) if st.get("status") == "done" else [],
+        }
+    )
+
+
+@app.route("/api/dedupe/move", methods=["POST"])
+def api_dedupe_move():
+    body = request.get_json(silent=True) or {}
+    scan_id = body.get("scan_id")
+    group_id = body.get("group_id")
+
+    if not scan_id or not isinstance(scan_id, str):
+        return _json_error("scan_id fehlt.", 400, code="bad_request")
+    if group_id is not None and not isinstance(group_id, str):
+        return _json_error("group_id muss string sein.", 400, code="bad_request")
+
+    with _DEDUPE_SCANS_LOCK:
+        scan = _DEDUPE_SCANS.get(scan_id)
+
+    if not scan:
+        return _json_error("Scan nicht gefunden.", 404, code="not_found")
+
+    try:
+        dest_rel = "Dubletten"
+        dest_dir_abs, dest_dir_norm = _safe_abs_path(app.config["VIDEO_ROOT"], dest_rel)
+        os.makedirs(dest_dir_abs, exist_ok=True)
+
+        moved = []
+        groups = scan.get("groups", [])
+        if not isinstance(groups, list):
+            groups = []
+
+        selected = []
+        for g in groups:
+            gid = g.get("group_id")
+            if not isinstance(gid, str):
+                continue
+            if group_id is None or gid == group_id:
+                selected.append(g)
+
+        if group_id is not None and not selected:
+            return _json_error("Gruppe nicht gefunden.", 404, code="not_found")
+
+        for g in selected:
+            keep = g.get("keep")
+            files = g.get("files", [])
+            if not isinstance(keep, str) or not isinstance(files, list):
+                continue
+            for rp in files:
+                if not isinstance(rp, str):
+                    continue
+                if rp == keep:
+                    continue
+                try:
+                    src_abs, src_norm = _safe_abs_path(app.config["VIDEO_ROOT"], rp)
+                    if not os.path.isfile(src_abs):
+                        continue
+
+                    src_filename = os.path.basename(src_norm)
+                    dest_filename = _unique_destination_filename(dest_dir_abs, src_filename)
+                    dest_abs = os.path.join(dest_dir_abs, dest_filename)
+                    shutil.move(src_abs, dest_abs)
+
+                    dest_relpath = dest_filename if dest_dir_norm == "" else f"{dest_dir_norm}/{dest_filename}"
+                    moved.append({"from": src_norm, "to": dest_relpath})
+                except Exception:
+                    continue
+
+            g["files"] = [keep]
+
+        with _DEDUPE_SCANS_LOCK:
+            scan["groups"] = groups
+            _DEDUPE_SCANS[scan_id] = scan
+
+        if moved:
+            _start_tag_index_build()
+
+        return jsonify({"ok": True, "moved": moved, "moved_count": len(moved)})
+    except ValueError:
+        return _json_error("Ungültiger Pfad.", 400, code="invalid_path")
+    except Exception:
+        return _json_error("Verschieben fehlgeschlagen.", 500, code="server_error")
 
 
 @app.route("/api/transfer", methods=["POST"])
@@ -1432,3 +1924,13 @@ with app.app_context():
     _ensure_dirs()
     _init_db()
     _start_tag_index_build()
+
+
+if __name__ == "__main__":
+    host = os.environ.get("HOST", "0.0.0.0")
+    try:
+        port = int(os.environ.get("PORT", "5000"))
+    except Exception:
+        port = 5000
+    debug = os.environ.get("FLASK_DEBUG", "").lower() in ("1", "true", "yes")
+    app.run(host=host, port=port, debug=debug)

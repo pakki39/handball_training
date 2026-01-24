@@ -9,11 +9,18 @@
   </head>
   <body>
     <header class="topbar">
-      <div class="app-title">Video Organizer</div>
+      <div class="topbar-left">
+        <div class="app-title">Video Organizer</div>
+        <nav class="tabs" aria-label="Navigation">
+          <button id="tabOrganizerBtn" class="tab-btn active" type="button">Organizer</button>
+          <button id="tabDublettenBtn" class="tab-btn" type="button">Dubletten</button>
+        </nav>
+      </div>
+      <div id="envInfo" class="env-info"></div>
       <div id="status" class="status"></div>
     </header>
 
-    <main class="container">
+    <main id="tabOrganizer" class="container tab-page active">
       <section class="left">
         <div class="panel">
           <div class="panel-header">
@@ -38,7 +45,7 @@
               <div class="browser-list">
                 <div class="browser-lists">
                   <div class="tag-results-wrap">
-                    <div class="panel-subtitle" style="padding: 2px 0 6px 2px;">Tag-Suche (Scan: ~/pve/Handball)</div>
+                    <div class="panel-subtitle" style="padding: 2px 0 6px 2px;">Tag-Suche (Scan: <span id="tagScanRootLabel"></span>)</div>
                     <div id="tagResultsList" class="list"></div>
                   </div>
                   <div id="browserHSplitter" class="splitter-h"></div>
@@ -114,6 +121,30 @@
           </div>
         </div>
       </aside>
+    </main>
+
+    <main id="tabDubletten" class="container tab-page">
+      <div class="panel tab-placeholder">
+        <div class="panel-header">
+          <div class="panel-title">Dubletten</div>
+          <div class="dedupe-controls">
+            <select id="dedupeDir" class="select"></select>
+            <button id="dedupeSearchBtn" class="btn btn-primary" type="button">Suche starten</button>
+            <button id="dedupeMoveAllBtn" class="btn" type="button" disabled>Alle Duplikate verschieben</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="dedupeSummary" class="panel-subtitle" style="padding: 2px 0 8px 2px;"></div>
+          <div id="dedupeStatusLine" class="dedupe-statusline">
+            <span id="dedupeSpinner" class="dedupe-spinner" aria-hidden="true"></span>
+            <span id="dedupeRunText" class="dedupe-runtext"></span>
+            <span id="dedupeLastPoll" class="dedupe-ts"></span>
+            <span id="dedupeLastUpdate" class="dedupe-ts"></span>
+          </div>
+          <div id="dedupeLog" class="dedupe-log"></div>
+          <div id="dedupeResults" class="list"></div>
+        </div>
+      </div>
     </main>
 
     <script src="{{ url_for('static', filename='app.js') }}"></script>

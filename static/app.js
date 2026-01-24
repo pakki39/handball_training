@@ -10,10 +10,123 @@ let state = {
   currentFileTags: [],
   clipMarkers: [],
   clipBusy: false,
+  dedupe: { scanId: null, groups: [], root: "", status: "idle", phase: "", message: "", lastPollMs: 0, lastUpdateMs: 0 },
 };
 
 function $(id) {
   return document.getElementById(id);
+}
+
+function renderDedupeLog(lines) {
+  const el = $("dedupeLog");
+  if (!el) return;
+  const arr = Array.isArray(lines) ? lines : [];
+  el.textContent = arr.join("\n");
+  el.scrollTop = el.scrollHeight;
+}
+
+function _fmtAgo(ms) {
+  const n = Number(ms) || 0;
+  if (!n) return "?";
+  const s = Math.max(0, (Date.now() - n) / 1000);
+  if (s < 1) return "0s";
+  if (s < 60) return `${Math.floor(s)}s`;
+  const m = Math.floor(s / 60);
+  const r = Math.floor(s - m * 60);
+  return `${m}m ${r}s`;
+}
+
+function renderDedupeHeartbeat() {
+  const line = $("dedupeStatusLine");
+  const spin = $("dedupeSpinner");
+  const run = $("dedupeRunText");
+  const poll = $("dedupeLastPoll");
+  const upd = $("dedupeLastUpdate");
+  if (!line || !spin || !run || !poll || !upd) return;
+
+  const status = state.dedupe.status || "idle";
+  const phase = state.dedupe.phase || "";
+  const msg = state.dedupe.message || "";
+  const running = status === "running";
+
+  spin.classList.toggle("running", running);
+
+  const pollAgo = _fmtAgo(state.dedupe.lastPollMs);
+  const updAgo = _fmtAgo(state.dedupe.lastUpdateMs);
+
+  let text = "Bereit.";
+  if (status === "running") text = `Läuft: ${phase}${msg ? ` – ${msg}` : ""}`;
+  if (status === "done") text = "Fertig.";
+  if (status === "error") text = "Fehler.";
+
+  run.textContent = text;
+  poll.textContent = state.dedupe.lastPollMs ? `Letzter Poll: ${pollAgo}` : "";
+  upd.textContent = state.dedupe.lastUpdateMs ? `Letztes Update: ${updAgo}` : "";
+
+  const stale = running && state.dedupe.lastUpdateMs && (Date.now() - state.dedupe.lastUpdateMs > 5000);
+  line.classList.toggle("stale", stale);
+}
+
+function setupTabs() {
+  const btnOrg = $("tabOrganizerBtn");
+  const btnDub = $("tabDublettenBtn");
+  const pageOrg = $("tabOrganizer");
+  const pageDub = $("tabDubletten");
+  if (!btnOrg || !btnDub || !pageOrg || !pageDub) return;
+
+  const KEY = "activeTab";
+
+  const setActive = (tab) => {
+    const t = tab === "dubletten" ? "dubletten" : "organizer";
+    try {
+      localStorage.setItem(KEY, t);
+    } catch {
+    }
+
+    const isOrg = t === "organizer";
+    btnOrg.classList.toggle("active", isOrg);
+    btnDub.classList.toggle("active", !isOrg);
+    pageOrg.classList.toggle("active", isOrg);
+    pageDub.classList.toggle("active", !isOrg);
+  };
+
+  btnOrg.addEventListener("click", () => setActive("organizer"));
+  btnDub.addEventListener("click", () => setActive("dubletten"));
+
+  let initial = "organizer";
+  try {
+    initial = localStorage.getItem(KEY) || "organizer";
+  } catch {
+  }
+  setActive(initial);
+}
+
+async function setupConfigLabels() {
+  const envInfo = $("envInfo");
+  const tagScanLabel = $("tagScanRootLabel");
+
+  try {
+    const cfg = await apiGet("/api/config");
+    const videoRoot = cfg && typeof cfg.video_root === "string" ? cfg.video_root : "";
+    const videoRootEnv = cfg && typeof cfg.video_root_env === "string" ? cfg.video_root_env : "";
+    const tagScanRoot = cfg && typeof cfg.tag_scan_root === "string" ? cfg.tag_scan_root : "";
+
+    if (envInfo) {
+      const envPart = videoRootEnv ? videoRootEnv : "(nicht gesetzt)";
+      const effPart = videoRoot ? videoRoot : "";
+      envInfo.textContent = `VIDEO_ROOT (ENV): ${envPart}${effPart && effPart !== envPart ? ` | effektiv: ${effPart}` : ""}`;
+      envInfo.title = envInfo.textContent;
+    }
+    if (tagScanLabel) {
+      const v = tagScanRoot || "";
+      tagScanLabel.textContent = v ? v : "(unbekannt)";
+      tagScanLabel.title = v;
+    }
+  } catch (_) {
+    if (tagScanLabel) {
+      tagScanLabel.textContent = "(unbekannt)";
+    }
+  }
 }
 
 function extractTagsFromFilename(filename) {
@@ -82,6 +195,294 @@ function formatTime(sec) {
   const mm = String(m).padStart(2, "0");
   const rr = r.toFixed(1).padStart(4, "0");
   return `${mm}:${rr}`;
+}
+
+function formatBytes(bytes) {
+  const b = Math.max(0, Number(bytes) || 0);
+  if (!Number.isFinite(b)) return "0 B";
+  if (b < 1024) return `${b.toFixed(0)} B`;
+  const kb = b / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  const gb = mb / 1024;
+  return `${gb.toFixed(2)} GB`;
+}
+
+function renderDedupeResults(groups) {
+  const el = $("dedupeResults");
+  const summaryEl = $("dedupeSummary");
+  const logEl = $("dedupeLog");
+  const moveAllBtn = $("dedupeMoveAllBtn");
+  if (!el) return;
+  el.innerHTML = "";
+
+  const arr = Array.isArray(groups) ? groups : [];
+  state.dedupe.groups = arr;
+
+  let dupFiles = 0;
+  let savedBytes = 0;
+  for (const g of arr) {
+    const files = Array.isArray(g.files) ? g.files : [];
+    const size = Number(g.size_bytes) || 0;
+    dupFiles += Math.max(0, files.length - 1);
+    savedBytes += Math.max(0, files.length - 1) * Math.max(0, size);
+  }
+
+  if (summaryEl) {
+    const rootLabel = state.dedupe.root ? state.dedupe.root : "/";
+    summaryEl.textContent = `Ordner: ${rootLabel} | Gruppen: ${arr.length} | Duplikat-Dateien: ${dupFiles} | Ersparnis: ${formatBytes(savedBytes)}`;
+  }
+  if (logEl && !logEl.textContent) {
+    logEl.textContent = "";
+  }
+  if (moveAllBtn) {
+    moveAllBtn.disabled = !(state.dedupe.scanId && dupFiles > 0);
+  }
+
+  if (arr.length === 0) {
+    renderInlineMessage(el, "INFO", "Keine Dubletten gefunden.");
+    return;
+  }
+
+  for (const g of arr) {
+    const files = Array.isArray(g.files) ? g.files : [];
+    const keep = String(g.keep || "");
+    const groupId = String(g.group_id || "");
+    const size = Number(g.size_bytes) || 0;
+
+    const wrap = document.createElement("div");
+    wrap.className = "dedupe-group";
+
+    const head = document.createElement("div");
+    head.className = "dedupe-group-head";
+
+    const meta = document.createElement("div");
+    meta.className = "dedupe-group-meta";
+    meta.textContent = `${files.length} Dateien | ${formatBytes(size)} | behalten: ${keep}`;
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn";
+    btn.textContent = "Duplikate verschieben";
+    btn.disabled = !(state.dedupe.scanId && groupId && files.length > 1);
+    btn.addEventListener("click", async () => {
+      if (!state.dedupe.scanId || !groupId) return;
+      btn.disabled = true;
+      try {
+        const resp = await apiPost("/api/dedupe/move", { scan_id: state.dedupe.scanId, group_id: groupId });
+        const moved = Array.isArray(resp.moved) ? resp.moved : [];
+        if (moved.length > 0) {
+          g.files = [keep];
+          renderDedupeResults(state.dedupe.groups);
+          setStatus(`Verschoben: ${moved.length}`, "ok");
+          try {
+            await loadList(state.currentPath);
+          } catch (_) {}
+        } else {
+          setStatus("Nichts verschoben.", "ok");
+        }
+      } catch (e) {
+        setStatus(e.message, "error");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    head.appendChild(meta);
+    head.appendChild(btn);
+    wrap.appendChild(head);
+
+    const filesEl = document.createElement("div");
+    filesEl.className = "dedupe-files";
+    for (const rp of files) {
+      const row = document.createElement("div");
+      row.className = "dedupe-file";
+
+      const pathEl = document.createElement("div");
+      pathEl.className = "dedupe-file-path";
+      pathEl.textContent = String(rp || "");
+
+      const badge = document.createElement("div");
+      badge.className = "badge";
+      badge.textContent = rp === keep ? "KEEP" : "DUP";
+
+      row.appendChild(pathEl);
+      row.appendChild(badge);
+      filesEl.appendChild(row);
+    }
+    wrap.appendChild(filesEl);
+    el.appendChild(wrap);
+  }
+}
+
+function setupDedupeUI() {
+  const dirEl = $("dedupeDir");
+  const btnScan = $("dedupeSearchBtn");
+  const btnMoveAll = $("dedupeMoveAllBtn");
+  const summaryEl = $("dedupeSummary");
+  const logEl = $("dedupeLog");
+  const resultsEl = $("dedupeResults");
+  if (!dirEl || !btnScan || !btnMoveAll || !resultsEl) return;
+
+  const KEY_DIR = "dedupeDir";
+  const setDirOptions = (dirs) => {
+    const arr = Array.isArray(dirs) ? dirs : [];
+    dirEl.innerHTML = "";
+    for (const d of arr) {
+      const opt = document.createElement("option");
+      const val = String(d || "");
+      opt.value = val;
+      opt.textContent = val === "" ? "/ (VIDEO_ROOT)" : val;
+      dirEl.appendChild(opt);
+    }
+  };
+
+  const loadDirs = async () => {
+    dirEl.disabled = true;
+    try {
+      const resp = await apiGet("/api/dedupe/dirs");
+      setDirOptions(resp.dirs || [""]);
+
+      let initial = "";
+      try {
+        initial = localStorage.getItem(KEY_DIR) || "";
+      } catch {
+      }
+      dirEl.value = initial;
+    } catch (e) {
+      if (summaryEl) summaryEl.textContent = e.message;
+    } finally {
+      dirEl.disabled = false;
+    }
+  };
+
+  dirEl.addEventListener("change", () => {
+    try {
+      localStorage.setItem(KEY_DIR, String(dirEl.value || ""));
+    } catch {
+    }
+  });
+
+  const heartbeatTimer = setInterval(renderDedupeHeartbeat, 500);
+
+  btnScan.addEventListener("click", async () => {
+    const dir = String(dirEl.value || "");
+    btnScan.disabled = true;
+    btnMoveAll.disabled = true;
+    state.dedupe.scanId = null;
+    state.dedupe.groups = [];
+    state.dedupe.root = dir;
+    state.dedupe.status = "running";
+    state.dedupe.phase = "Start";
+    state.dedupe.message = "Suche läuft…";
+    state.dedupe.lastPollMs = Date.now();
+    state.dedupe.lastUpdateMs = 0;
+    if (summaryEl) summaryEl.textContent = "Suche läuft…";
+    if (logEl) logEl.textContent = "";
+    resultsEl.innerHTML = "";
+    renderDedupeHeartbeat();
+
+    try {
+      const start = await apiPost("/api/dedupe/scan", { dir_relpath: dir });
+      state.dedupe.scanId = start.scan_id || null;
+      state.dedupe.root = start.root || dir;
+      if (!state.dedupe.scanId) {
+        throw new Error("Scan konnte nicht gestartet werden.");
+      }
+
+      const startedAt = Date.now();
+      while (true) {
+        state.dedupe.lastPollMs = Date.now();
+        const st = await apiGet(`/api/dedupe/scan/status/${state.dedupe.scanId}`);
+        state.dedupe.lastPollMs = Date.now();
+        const p = st && st.progress ? st.progress : {};
+        const msg = st && st.message ? String(st.message) : "";
+
+        state.dedupe.status = st.status || "running";
+        state.dedupe.phase = st.phase || "";
+        state.dedupe.message = msg;
+        if (st && st.updated_at) {
+          const t = Date.parse(String(st.updated_at));
+          if (Number.isFinite(t)) state.dedupe.lastUpdateMs = t;
+        }
+        renderDedupeHeartbeat();
+
+        if (summaryEl) {
+          const rootLabel = state.dedupe.root ? state.dedupe.root : "/";
+          const dirs = Number(p.dirs) || 0;
+          const vids = Number(p.video_files) || 0;
+          const cand = Number(p.candidate_files) || 0;
+          const hashed = Number(p.hashed_files) || 0;
+          const dups = Number(p.duplicate_files) || 0;
+          summaryEl.textContent = `Ordner: ${rootLabel} | ${msg} | Dirs: ${dirs} | Videos: ${vids} | Kandidaten: ${cand} | Hash: ${hashed}/${cand} | Duplikate: ${dups}`;
+        }
+        renderDedupeLog(st.log_tail || []);
+
+        if (st.status === "done") {
+          state.dedupe.groups = st.groups || [];
+          renderDedupeResults(state.dedupe.groups);
+          setStatus("Suche abgeschlossen.", "ok");
+          state.dedupe.status = "done";
+          renderDedupeHeartbeat();
+          break;
+        }
+        if (st.status === "error") {
+          const err = st && st.error ? String(st.error) : "Scan fehlgeschlagen.";
+          state.dedupe.status = "error";
+          renderDedupeHeartbeat();
+          throw new Error(err);
+        }
+
+        if (Date.now() - startedAt > 1000 * 60 * 30) {
+          throw new Error("Scan dauert zu lange (Timeout). ");
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    } catch (e) {
+      state.dedupe.status = "error";
+      state.dedupe.message = e.message;
+      renderDedupeHeartbeat();
+      if (summaryEl) summaryEl.textContent = "";
+      renderInlineMessage(resultsEl, "ERROR", e.message);
+      setStatus(e.message, "error");
+    } finally {
+      btnScan.disabled = false;
+      if (state.dedupe.status !== "running") {
+        btnMoveAll.disabled = !(state.dedupe.scanId && Array.isArray(state.dedupe.groups) && state.dedupe.groups.length > 0);
+      }
+    }
+  });
+
+  btnMoveAll.addEventListener("click", async () => {
+    if (!state.dedupe.scanId) return;
+    const ok = window.confirm("Alle gefundenen Duplikate nach 'Dubletten' verschieben?\n\n(Je Gruppe bleibt eine Datei erhalten.)");
+    if (!ok) return;
+
+    btnMoveAll.disabled = true;
+    try {
+      const resp = await apiPost("/api/dedupe/move", { scan_id: state.dedupe.scanId });
+      const moved = Array.isArray(resp.moved) ? resp.moved : [];
+      if (moved.length > 0) {
+        for (const g of state.dedupe.groups) {
+          if (g && g.keep) g.files = [g.keep];
+        }
+        renderDedupeResults(state.dedupe.groups);
+        setStatus(`Verschoben: ${moved.length}`, "ok");
+        try {
+          await loadList(state.currentPath);
+        } catch (_) {}
+      } else {
+        setStatus("Nichts verschoben.", "ok");
+      }
+    } catch (e) {
+      setStatus(e.message, "error");
+    } finally {
+      btnMoveAll.disabled = false;
+    }
+  });
+
+  loadDirs();
 }
 
 function _sortedUniqueMarkers(markers) {
@@ -2208,6 +2609,9 @@ function setupDropZone() {
 }
 
 async function main() {
+  setupTabs();
+  setupConfigLabels();
+  setupDedupeUI();
   setupGlobalFileContextMenu();
   setupBrowserListSplitter();
   setupDropZone();
