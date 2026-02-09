@@ -30,6 +30,7 @@
               <select id="tagDropdown" class="select">
                 <option value="">Tag auswählen…</option>
               </select>
+              <label class="tag-mode"><input id="noTagsFilter" type="checkbox" /> Ohne Tags</label>
               <input id="nameQuery" class="input" type="text" placeholder="Dateiname suchen (z.B. canayer)" />
               <button id="nameSearchBtn" class="btn" type="button">Name suchen</button>
               <label class="tag-mode"><input type="radio" name="tagMode" value="and" checked /> UND</label>
@@ -63,6 +64,14 @@
                   </div>
                   <div id="videoTags" class="tag-chips"></div>
                   <div class="tag-editor-add">
+                    <select id="tagAssignDropdown" class="select">
+                      <option value="">Tag zuweisen…</option>
+                    </select>
+                    <select id="tagRemoveDropdown" class="select">
+                      <option value="">Tag entfernen…</option>
+                    </select>
+                    <button id="sourceSelectionClearBtn" class="btn" type="button" disabled>Auswahl löschen</button>
+                    <button id="sourceSelectionSelectAllResultsBtn" class="btn" type="button" disabled>Alle markieren</button>
                     <input id="tagEditInput" class="input" type="text" placeholder="Tag hinzufügen…" list="tagSuggestions" />
                     <datalist id="tagSuggestions"></datalist>
                     <button id="tagAddBtn" class="btn" type="button">Hinzufügen</button>
@@ -102,6 +111,8 @@
                 <option value="android_small" selected>Android (klein)</option>
                 <option value="copy">Original (Copy)</option>
               </select>
+              <label class="tag-mode"><input id="queueSelectAllCb" type="checkbox" /> Alle</label>
+              <button id="queueDownloadSelectedBtn" class="btn" type="button" disabled>Download (Auswahl)</button>
               <button id="mergeDownloadBtn" class="btn btn-primary" type="button">Download (Merge)</button>
               <button id="queueClearAll" class="btn" type="button">Alle löschen</button>
             </div>

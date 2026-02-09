@@ -12,9 +12,10 @@ import uuid
 import tempfile
 import json
 import hashlib
+import zipfile
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify, render_template, request, send_file, g, Response
+from flask import Flask, jsonify, render_template, request, send_file, g, Response, after_this_request
 
 import config
 
@@ -1386,6 +1387,95 @@ def api_queue_clear():
     return jsonify({"ok": True, "deleted_count": count})
 
 
+@app.route("/api/queue/download_zip", methods=["GET"])
+def api_queue_download_zip():
+    ids_raw = request.args.get("ids", "")
+    if not ids_raw or not isinstance(ids_raw, str):
+        return _json_error("ids fehlt.", 400, code="bad_request")
+
+    parts = [p.strip() for p in ids_raw.split(",") if p.strip()]
+    ids: list[int] = []
+    seen = set()
+    try:
+        for p in parts:
+            n = int(p)
+            if n <= 0:
+                continue
+            if n in seen:
+                continue
+            seen.add(n)
+            ids.append(n)
+    except Exception:
+        return _json_error("ids muss CSV von ints sein.", 400, code="bad_request")
+
+    if not ids:
+        return _json_error("Keine gültigen IDs.", 400, code="bad_request")
+
+    items = _queue_get_items()
+    by_id = {int(it["id"]): it for it in items if it.get("id") is not None}
+
+    selected = []
+    for item_id in ids:
+        it = by_id.get(item_id)
+        if not it:
+            return _json_error("Item nicht gefunden.", 404, code="not_found", details={"id": item_id})
+        selected.append(it)
+
+    tmp_dir = os.path.dirname(app.config["DB_PATH"])
+    zip_fd, zip_path = tempfile.mkstemp(prefix="queue_selected_", suffix=".zip", dir=tmp_dir)
+    os.close(zip_fd)
+
+    try:
+        def _zip_arcname(index: int, item: dict) -> str:
+            fn = str(item.get("filename") or "")
+            rp = str(item.get("target_relpath") or "")
+            item_id = int(item.get("id") or 0)
+
+            h = hashlib.sha1(rp.encode("utf-8")).hexdigest()[:8] if rp else "00000000"
+            _base, ext = os.path.splitext(fn if fn else os.path.basename(rp))
+            ext = ext or ""
+            return f"{index:03d}_{item_id}_{h}{ext}"
+
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for idx, it in enumerate(selected, start=1):
+                rp = it.get("target_relpath")
+                if not rp:
+                    continue
+                abs_p, _ = _safe_abs_path(app.config["TARGET_ROOT"], rp)
+                if not os.path.isfile(abs_p):
+                    raise FileNotFoundError(rp)
+                arcname = _zip_arcname(idx, it)
+                zf.write(abs_p, arcname=arcname)
+    except FileNotFoundError:
+        try:
+            os.remove(zip_path)
+        except Exception:
+            pass
+        return _json_error("Datei nicht gefunden.", 404, code="not_found")
+    except Exception:
+        try:
+            os.remove(zip_path)
+        except Exception:
+            pass
+        return _json_error("ZIP-Erstellung fehlgeschlagen.", 500, code="server_error")
+
+    @after_this_request
+    def _cleanup(resp):
+        try:
+            os.remove(zip_path)
+        except Exception:
+            pass
+        return resp
+
+    return send_file(
+        zip_path,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="queue_selected.zip",
+        conditional=False,
+    )
+
+
 @app.route("/api/merge/start", methods=["POST"])
 def api_merge_start():
     body = request.get_json(silent=True) or {}
@@ -1490,6 +1580,38 @@ def api_tags_search():
     limit = max(1, min(2000, limit))
 
     tokens = [t for t in re.split(r"[\s,]+", query.strip()) if t]
+    
+    # Spezialfall: Suche nach Dateien ohne Tags
+    if query.strip() == "__no_tags__":
+        try:
+            idx = _get_tag_index(refresh=refresh)
+            entries = idx["entries"]
+            
+            results = []
+            for e in entries:
+                if not e["tags"]:  # Datei hat keine Tags
+                    results.append({"relpath": e["relpath"], "name": e["name"], "tags": e["tags"]})
+                if len(results) >= limit:
+                    break
+            
+            return jsonify(
+                {
+                    "ok": True,
+                    "query": query,
+                    "mode": mode,
+                    "count": len(results),
+                    "results": results,
+                }
+            )
+        except ValueError as e:
+            if str(e) == "tag_root_outside_video_root":
+                return _json_error("TAG_SCAN_ROOT muss innerhalb von VIDEO_ROOT liegen.", 400, code="bad_request")
+            return _json_error("Ungültiger Pfad.", 400, code="invalid_path")
+        except FileNotFoundError:
+            return _json_error("TAG_SCAN_ROOT nicht gefunden.", 404, code="not_found")
+        except Exception:
+            return _json_error("Tagsuche fehlgeschlagen.", 500, code="server_error")
+    
     if not tokens:
         return jsonify({"ok": True, "query": "", "mode": mode, "results": [], "count": 0})
     want = [t.lower() for t in tokens]

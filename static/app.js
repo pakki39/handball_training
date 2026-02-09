@@ -5,6 +5,9 @@ let state = {
   queue: [],
   sortable: null,
   currentVideo: null,
+  queueSelectedIds: new Set(),
+  sourceSelectedRelpaths: new Set(),
+  sourceSelectionAnchor: null,
   tagResults: [],
   tagIndex: { tags: [], building: false, error: null },
   currentFileTags: [],
@@ -12,6 +15,227 @@ let state = {
   clipBusy: false,
   dedupe: { scanId: null, groups: [], root: "", status: "idle", phase: "", message: "", lastPollMs: 0, lastUpdateMs: 0 },
 };
+
+function _selectedSourceRelpathsArray() {
+  if (!(state.sourceSelectedRelpaths instanceof Set)) {
+    state.sourceSelectedRelpaths = new Set();
+  }
+  return Array.from(state.sourceSelectedRelpaths).map((x) => String(x || "")).filter(Boolean);
+}
+
+function syncSourceSelectionCheckboxes() {
+  const updateIn = (wrap) => {
+    if (!wrap) return;
+    for (const row of wrap.querySelectorAll('.item[data-relpath]')) {
+      const rp = String(row.dataset.relpath || "");
+      const cb = row.querySelector('input.source-select');
+      if (!cb) continue;
+      cb.checked = (state.sourceSelectedRelpaths instanceof Set) && state.sourceSelectedRelpaths.has(rp);
+    }
+  };
+
+  updateIn($("tagResultsList"));
+  updateIn($("folderList"));
+  updateSourceSelectionClearButton();
+  updateSourceSelectionSelectAllResultsButton();
+}
+
+function handleSourceCheckboxToggle({ containerKind, relpath, checked, shiftKey }) {
+  const rp = String(relpath || "");
+  if (!rp) return;
+  if (!(state.sourceSelectedRelpaths instanceof Set)) state.sourceSelectedRelpaths = new Set();
+
+  const wrap = containerKind === "folders" ? $("folderList") : $("tagResultsList");
+  const items = wrap ? Array.from(wrap.querySelectorAll('.item[data-relpath]')).map((row) => String(row.dataset.relpath || "")) : [];
+
+  const canRange = Boolean(
+    shiftKey &&
+      state.sourceSelectionAnchor &&
+      state.sourceSelectionAnchor.kind === containerKind &&
+      typeof state.sourceSelectionAnchor.relpath === "string" &&
+      items.length > 0
+  );
+
+  if (canRange) {
+    const a = items.indexOf(String(state.sourceSelectionAnchor.relpath));
+    const b = items.indexOf(rp);
+    if (a >= 0 && b >= 0) {
+      const lo = Math.min(a, b);
+      const hi = Math.max(a, b);
+      for (let i = lo; i <= hi; i += 1) {
+        const rpi = String(items[i] || "");
+        if (!rpi) continue;
+        if (checked) state.sourceSelectedRelpaths.add(rpi);
+        else state.sourceSelectedRelpaths.delete(rpi);
+      }
+      syncSourceSelectionCheckboxes();
+      refreshTagEditorForCurrentVideo();
+      return;
+    }
+  }
+
+  if (checked) state.sourceSelectedRelpaths.add(rp);
+  else state.sourceSelectedRelpaths.delete(rp);
+  state.sourceSelectionAnchor = { kind: containerKind, relpath: rp };
+  syncSourceSelectionCheckboxes();
+  refreshTagEditorForCurrentVideo();
+}
+
+function updateTagEditorHintForSelection() {
+  const selCount = (state.sourceSelectedRelpaths instanceof Set) ? state.sourceSelectedRelpaths.size : 0;
+  if (selCount > 0) {
+    setTagEditorHint(`Auswahl: ${selCount} Datei(en)`);
+    setTagEditorEnabled(true);
+    updateSourceSelectionClearButton();
+  }
+}
+
+function updateSourceSelectionClearButton() {
+  const btn = $("sourceSelectionClearBtn");
+  if (!btn) return;
+  const n = (state.sourceSelectedRelpaths instanceof Set) ? state.sourceSelectedRelpaths.size : 0;
+  btn.disabled = n <= 0;
+  btn.textContent = n > 0 ? `Auswahl löschen (${n})` : "Auswahl löschen";
+}
+
+function updateSourceSelectionSelectAllResultsButton() {
+  const btn = $("sourceSelectionSelectAllResultsBtn");
+  if (!btn) return;
+  const items = Array.isArray(state.tagResults) ? state.tagResults : [];
+  const total = items.length;
+
+  if (total <= 0) {
+    btn.disabled = true;
+    btn.textContent = "Alle markieren";
+    return;
+  }
+
+  if (!(state.sourceSelectedRelpaths instanceof Set)) {
+    state.sourceSelectedRelpaths = new Set();
+  }
+
+  let selectedInResults = 0;
+  for (const r of items) {
+    const rp = String((r && r.relpath) || "");
+    if (!rp) continue;
+    if (state.sourceSelectedRelpaths.has(rp)) selectedInResults += 1;
+  }
+
+  btn.disabled = total <= 0;
+  btn.textContent = selectedInResults >= total ? `Alle markiert (${total})` : `Alle markieren (${total})`;
+}
+
+function selectAllSourceResults({ rerender = true } = {}) {
+  const items = Array.isArray(state.tagResults) ? state.tagResults : [];
+  if (items.length === 0) return;
+
+  if (!(state.sourceSelectedRelpaths instanceof Set)) {
+    state.sourceSelectedRelpaths = new Set();
+  }
+  state.sourceSelectionAnchor = null;
+
+  for (const r of items) {
+    const rp = String((r && r.relpath) || "");
+    if (!rp) continue;
+    state.sourceSelectedRelpaths.add(rp);
+  }
+
+  if (rerender) {
+    renderResults(state.lastResultsKind || "tag", state.tagResults);
+    if (state.lastList) {
+      renderFolders(state.lastList);
+    }
+  }
+  refreshTagEditorForCurrentVideo();
+  updateSourceSelectionClearButton();
+  updateSourceSelectionSelectAllResultsButton();
+}
+
+function clearSourceSelection({ rerender = true } = {}) {
+  if (!(state.sourceSelectedRelpaths instanceof Set)) {
+    state.sourceSelectedRelpaths = new Set();
+  }
+  state.sourceSelectionAnchor = null;
+  if (state.sourceSelectedRelpaths.size === 0) {
+    updateSourceSelectionClearButton();
+    updateSourceSelectionSelectAllResultsButton();
+    return;
+  }
+  state.sourceSelectedRelpaths.clear();
+  if (rerender) {
+    if (Array.isArray(state.tagResults) && state.tagResults.length > 0) {
+      renderResults(state.lastResultsKind || "tag", state.tagResults);
+    }
+    if (state.lastList) {
+      renderFolders(state.lastList);
+    }
+  }
+  refreshTagEditorForCurrentVideo();
+  updateSourceSelectionClearButton();
+  updateSourceSelectionSelectAllResultsButton();
+}
+
+function updateQueueSelectedDownloadButton() {
+  const btn = $("queueDownloadSelectedBtn");
+  if (!btn) return;
+  const n = state.queueSelectedIds ? state.queueSelectedIds.size : 0;
+  btn.disabled = n <= 0;
+  btn.textContent = n > 0 ? `Download (Auswahl: ${n})` : "Download (Auswahl)";
+}
+
+function renderTagAssignDropdown(tags) {
+  const sel = $("tagAssignDropdown");
+  if (!sel) return;
+  sel.innerHTML = "";
+  const opt0 = document.createElement("option");
+  opt0.value = "";
+  opt0.textContent = "Tag zuweisen…";
+  sel.appendChild(opt0);
+
+  const items = [...(tags || [])].sort((a, b) => {
+    const aa = String((a && a.tag) || "").toLowerCase();
+    const bb = String((b && b.tag) || "").toLowerCase();
+    return aa.localeCompare(bb, "de");
+  });
+  for (const it of items) {
+    const opt = document.createElement("option");
+    opt.value = it.tag;
+    opt.textContent = it.tag;
+    sel.appendChild(opt);
+  }
+}
+
+function renderTagRemoveDropdown(tags) {
+  const sel = $("tagRemoveDropdown");
+  if (!sel) return;
+  sel.innerHTML = "";
+  const opt0 = document.createElement("option");
+  opt0.value = "";
+  opt0.textContent = "Tag entfernen…";
+  sel.appendChild(opt0);
+
+  const items = [...(tags || [])].sort((a, b) => {
+    const aa = String((a && a.tag) || "").toLowerCase();
+    const bb = String((b && b.tag) || "").toLowerCase();
+    return aa.localeCompare(bb, "de");
+  });
+  for (const it of items) {
+    const opt = document.createElement("option");
+    opt.value = it.tag;
+    opt.textContent = it.tag;
+    sel.appendChild(opt);
+  }
+}
+
+function updateQueueSelectAllCheckbox() {
+  const cb = $("queueSelectAllCb");
+  if (!cb) return;
+  const total = Array.isArray(state.queue) ? state.queue.length : 0;
+  const sel = state.queueSelectedIds ? state.queueSelectedIds.size : 0;
+  cb.disabled = total === 0;
+  cb.checked = total > 0 && sel === total;
+  cb.indeterminate = sel > 0 && sel < total;
+}
 
 function $(id) {
   return document.getElementById(id);
@@ -155,8 +379,12 @@ function filenameFromRelpath(relpath) {
 function setTagEditorEnabled(enabled) {
   const input = $("tagEditInput");
   const btn = $("tagAddBtn");
+  const assign = $("tagAssignDropdown");
+  const remove = $("tagRemoveDropdown");
   if (input) input.disabled = !enabled;
   if (btn) btn.disabled = !enabled;
+  if (assign) assign.disabled = !enabled;
+  if (remove) remove.disabled = !enabled;
 }
 
 function setTagEditorHint(text) {
@@ -690,6 +918,77 @@ function bindFileContextMenu(rowEl, relpath, displayName) {
     e.preventDefault();
     e.stopPropagation();
     _showFileMenuAt(e.clientX, e.clientY, rp, dn);
+  });
+}
+
+function setupQueueSelectAllUI() {
+  const cb = $("queueSelectAllCb");
+  if (!cb) return;
+
+  updateQueueSelectAllCheckbox();
+
+  cb.addEventListener("change", async () => {
+    const wantChecked = Boolean(cb.checked);
+    if (setupQueueSelectAllUI._busy) return;
+    setupQueueSelectAllUI._busy = true;
+    try {
+      if (!Array.isArray(state.queue) || state.queue.length === 0) {
+        await loadQueue();
+      }
+
+      cb.checked = wantChecked;
+      cb.indeterminate = false;
+      if (!(state.queueSelectedIds instanceof Set)) {
+        state.queueSelectedIds = new Set();
+      }
+      if (wantChecked) {
+        for (const it of state.queue || []) {
+          const idNum = Number(it && it.id);
+          if (Number.isFinite(idNum) && idNum > 0) state.queueSelectedIds.add(idNum);
+        }
+      } else {
+        state.queueSelectedIds.clear();
+      }
+
+      const listEl = $("queueList");
+      if (listEl) {
+        for (const rowCb of listEl.querySelectorAll(".queue-select")) {
+          rowCb.checked = wantChecked;
+        }
+      }
+      updateQueueSelectedDownloadButton();
+      updateQueueSelectAllCheckbox();
+    } catch (e) {
+      setStatus(e.message, "error");
+    } finally {
+      setupQueueSelectAllUI._busy = false;
+    }
+  });
+}
+
+function setupQueueSelectedDownloadUI() {
+  const btn = $("queueDownloadSelectedBtn");
+  if (!btn) return;
+
+  updateQueueSelectedDownloadButton();
+
+  btn.addEventListener("click", async () => {
+    try {
+      await loadQueue();
+      const ids = Array.from(state.queueSelectedIds || []).map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0);
+      if (ids.length === 0) {
+        setStatus("Keine Auswahl.", "error");
+        updateQueueSelectedDownloadButton();
+        return;
+      }
+      if (!window.confirm(`Auswahl als ZIP downloaden? (${ids.length})`)) {
+        return;
+      }
+      const qs = ids.join(",");
+      window.location.href = `/api/queue/download_zip?ids=${encodeURIComponent(qs)}&t=${Date.now()}`;
+    } catch (e) {
+      setStatus(e.message, "error");
+    }
   });
 }
 
@@ -1514,11 +1813,17 @@ function updateTagSuggestions() {
 }
 
 function refreshTagEditorForCurrentVideo() {
+  const selCount = (state.sourceSelectedRelpaths instanceof Set) ? state.sourceSelectedRelpaths.size : 0;
+  updateSourceSelectionClearButton();
+  updateSourceSelectionSelectAllResultsButton();
   if (!state.currentVideo || state.currentVideo.kind !== "source") {
     state.currentFileTags = [];
     setTagEditorHint("");
     renderVideoTagChips([]);
     setTagEditorEnabled(false);
+    if (selCount > 0) {
+      updateTagEditorHintForSelection();
+    }
     return;
   }
 
@@ -1528,45 +1833,100 @@ function refreshTagEditorForCurrentVideo() {
   renderVideoTagChips(state.currentFileTags);
   setTagEditorEnabled(true);
   updateTagSuggestions();
+
+  if (selCount > 0) {
+    setTagEditorHint(`${state.currentVideo.relpath} | Auswahl: ${selCount}`);
+  }
 }
 
-async function applyTagEdit(action, tag) {
-  if (!state.currentVideo || state.currentVideo.kind !== "source") return;
-  const relpath = state.currentVideo.relpath;
-  const oldRelpath = relpath;
-  try {
-    const resp = await apiPost("/api/tags/edit", { relpath, action, tag });
-    if (resp && resp.changed) {
-      state.currentVideo.relpath = resp.relpath;
+async function applyTagEditToRelpath(relpath, action, tag) {
+  const rp = String(relpath || "");
+  if (!rp) return null;
+  const oldRelpath = rp;
+
+  const resp = await apiPost("/api/tags/edit", { relpath: rp, action, tag });
+  if (resp && resp.changed) {
+    const newRelpath = resp.relpath;
+
+    if (state.currentVideo && state.currentVideo.kind === "source" && state.currentVideo.relpath === oldRelpath) {
+      state.currentVideo.relpath = newRelpath;
       const player = $("videoPlayer");
       if (player) {
-        player.src = `/media/source/${encodePath(resp.relpath)}`;
+        player.src = `/media/source/${encodePath(newRelpath)}`;
         player.load();
         player.play().catch(() => {});
       }
+    }
 
-      if (Array.isArray(state.tagResults) && state.tagResults.length > 0) {
-        let anyChanged = false;
-        for (const r of state.tagResults) {
-          if (r && r.relpath === oldRelpath) {
-            r.relpath = resp.relpath;
-            if (resp.name) r.name = resp.name;
-            anyChanged = true;
-          }
-        }
-        if (anyChanged) {
-          renderResults(state.lastResultsKind || "tag", state.tagResults);
+    if (Array.isArray(state.tagResults) && state.tagResults.length > 0) {
+      let anyChanged = false;
+      for (const r of state.tagResults) {
+        if (r && r.relpath === oldRelpath) {
+          r.relpath = newRelpath;
+          if (resp.name) r.name = resp.name;
+          anyChanged = true;
         }
       }
+      if (anyChanged) {
+        renderResults(state.lastResultsKind || "tag", state.tagResults);
+      }
     }
-    state.currentFileTags = resp.tags || [];
-    renderVideoTagChips(state.currentFileTags);
 
+    if (state.sourceSelectedRelpaths instanceof Set && state.sourceSelectedRelpaths.has(oldRelpath)) {
+      state.sourceSelectedRelpaths.delete(oldRelpath);
+      state.sourceSelectedRelpaths.add(newRelpath);
+    }
+  }
+
+  return resp;
+}
+
+async function applyTagEditToTargets(action, tag, relpaths) {
+  const targets = Array.isArray(relpaths) ? relpaths.map((x) => String(x || "")).filter(Boolean) : [];
+  if (targets.length === 0) return;
+
+  let okCount = 0;
+  let errCount = 0;
+  for (const rp of targets) {
+    try {
+      const resp = await applyTagEditToRelpath(rp, action, tag);
+      if (resp) okCount += 1;
+    } catch (e) {
+      errCount += 1;
+    }
+  }
+
+  refreshTagEditorForCurrentVideo();
+  await loadList(state.currentPath);
+  await loadTagIndex({ refresh: true });
+  await waitForTagIndexReady({ maxMs: 60000 });
+  updateTagSuggestions();
+
+  if (errCount > 0) {
+    setStatus(`Tags teilweise aktualisiert. OK: ${okCount}, Fehler: ${errCount}`, "error");
+  } else {
+    setStatus(`Tags aktualisiert. (${okCount})`, "ok");
+  }
+}
+
+async function applyTagEdit(action, tag) {
+  const selected = _selectedSourceRelpathsArray();
+  if (selected.length > 0) {
+    await applyTagEditToTargets(action, tag, selected);
+    return;
+  }
+
+  if (!state.currentVideo || state.currentVideo.kind !== "source") return;
+  try {
+    const resp = await applyTagEditToRelpath(state.currentVideo.relpath, action, tag);
+    if (resp) {
+      state.currentFileTags = resp.tags || [];
+      renderVideoTagChips(state.currentFileTags);
+    }
     await loadList(state.currentPath);
     await loadTagIndex({ refresh: true });
     await waitForTagIndexReady({ maxMs: 60000 });
     updateTagSuggestions();
-
     setStatus("Tags aktualisiert.", "ok");
   } catch (e) {
     setStatus(e.message, "error");
@@ -1615,6 +1975,12 @@ function renderTagDropdown(tags) {
   opt0.textContent = "Tag auswählen…";
   sel.appendChild(opt0);
 
+  // Füge "Keine Tags" Option hinzu
+  const optNoTags = document.createElement("option");
+  optNoTags.value = "__no_tags__";
+  optNoTags.textContent = "Keine Tags";
+  sel.appendChild(optNoTags);
+
   const items = [...(tags || [])].sort((a, b) => {
     const aa = String((a && a.tag) || "").toLowerCase();
     const bb = String((b && b.tag) || "").toLowerCase();
@@ -1644,11 +2010,13 @@ async function loadTagIndex({ refresh = false } = {}) {
 
     if (!data.building && !data.error) {
       renderTagDropdown(data.tags || []);
+      renderTagAssignDropdown(data.tags || []);
+      renderTagRemoveDropdown(data.tags || []);
     }
     return data;
   } catch (e) {
     setTagIndexStatus(`Tag-Scan Fehler: ${e.message}`);
-    return null;
+    return { tags: [], building: false, error: e.message };
   }
 }
 
@@ -1695,6 +2063,7 @@ function renderResults(kind, results) {
     row.dataset.relpath = r.relpath;
     row.innerHTML = `
       <div class="item-left">
+        <input class="source-select" type="checkbox" ${state.sourceSelectedRelpaths instanceof Set && state.sourceSelectedRelpaths.has(String(r.relpath || "")) ? "checked" : ""} />
         <span class="badge">${kind === "name" ? "NAME" : "TAG"}</span>
         <div class="name">${escapeHtml(r.name)}</div>
       </div>
@@ -1702,6 +2071,20 @@ function renderResults(kind, results) {
         ${escapeHtml(r.relpath)}
       </div>
     `;
+
+    const cb = row.querySelector(".source-select");
+    if (cb) {
+      cb.addEventListener("mousedown", (e) => e.stopPropagation());
+      cb.addEventListener("click", (e) => {
+        e.stopPropagation();
+        handleSourceCheckboxToggle({
+          containerKind: "results",
+          relpath: r.relpath,
+          checked: Boolean(cb.checked),
+          shiftKey: Boolean(e.shiftKey),
+        });
+      });
+    }
 
     row.addEventListener("dragstart", (e) => {
       e.dataTransfer.setData("text/plain", r.relpath);
@@ -1724,7 +2107,11 @@ function renderResults(kind, results) {
     el.appendChild(row);
   }
 
+  updateSourceSelectionSelectAllResultsButton();
   updateActivePlayingHighlights();
+
+  updateQueueSelectedDownloadButton();
+  updateQueueSelectAllCheckbox();
 }
 
 function renderTagResults(results) {
@@ -1749,7 +2136,11 @@ async function runTagSearch({ refresh = false } = {}) {
     });
     state.tagResults = resp.results || [];
     renderTagResults(state.tagResults);
-    if (query.trim() !== "") {
+    
+    // Spezielle Statusmeldung für "Keine Tags" Suche
+    if (query.trim() === "__no_tags__") {
+      setStatus(`Dateien ohne Tags: ${resp.count} Treffer.`, "ok");
+    } else if (query.trim() !== "") {
       setStatus(`Tag-Suche: ${resp.count} Treffer.`, "ok");
     }
   } catch (e) {
@@ -1764,9 +2155,15 @@ function setupTagSearchUI() {
   const btn = $("tagSearchBtn");
   const rescan = $("tagRescanBtn");
   const dropdown = $("tagDropdown");
+  const noTags = $("noTagsFilter");
 
   if (btn) {
-    btn.addEventListener("click", () => runTagSearch({ refresh: false }));
+    btn.addEventListener("click", () => {
+      if (noTags && noTags.checked && q) {
+        q.value = "__no_tags__";
+      }
+      runTagSearch({ refresh: false });
+    });
   }
   if (rescan) {
     rescan.addEventListener("click", async () => {
@@ -1778,7 +2175,17 @@ function setupTagSearchUI() {
   if (q) {
     q.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
+        if (noTags && noTags.checked) {
+          q.value = "__no_tags__";
+        }
         runTagSearch({ refresh: false });
+      }
+    });
+    q.addEventListener("input", () => {
+      if (!noTags) return;
+      const v = String(q.value || "").trim();
+      if (v !== "__no_tags__") {
+        noTags.checked = false;
       }
     });
   }
@@ -1798,6 +2205,27 @@ function setupTagSearchUI() {
     dropdown.addEventListener("change", async () => {
       const tag = dropdown.value;
       if (!tag) return;
+      
+      // Spezialbehandlung für "Keine Tags"
+      if (tag === "__no_tags__") {
+        if (q) {
+          q.value = "__no_tags__";
+        }
+        if (noTags) {
+          noTags.checked = true;
+        }
+        dropdown.value = "";
+        await runTagSearch({ refresh: false });
+        return;
+      }
+
+      if (noTags && noTags.checked) {
+        noTags.checked = false;
+        if (q && String(q.value || "").trim() === "__no_tags__") {
+          q.value = "";
+        }
+      }
+      
       if (q) {
         const existing = String(q.value || "").trim();
         q.value = existing ? `${existing} ${tag}` : tag;
@@ -1806,11 +2234,33 @@ function setupTagSearchUI() {
       await runTagSearch({ refresh: false });
     });
   }
+
+  if (noTags) {
+    noTags.addEventListener("change", async () => {
+      try {
+        if (noTags.checked) {
+          if (q) q.value = "__no_tags__";
+          if (dropdown) dropdown.value = "";
+          await runTagSearch({ refresh: false });
+          return;
+        }
+        if (q && String(q.value || "").trim() === "__no_tags__") {
+          q.value = "";
+        }
+      } catch (e) {
+        setStatus(e.message, "error");
+      }
+    });
+  }
 }
 
 function setupTagEditorUI() {
   const input = $("tagEditInput");
   const btn = $("tagAddBtn");
+  const assign = $("tagAssignDropdown");
+  const remove = $("tagRemoveDropdown");
+  const clearBtn = $("sourceSelectionClearBtn");
+  const selectAllBtn = $("sourceSelectionSelectAllResultsBtn");
 
   if (input) {
     input.addEventListener("input", () => {
@@ -1837,7 +2287,47 @@ function setupTagEditorUI() {
     });
   }
 
+  if (assign) {
+    assign.addEventListener("change", async () => {
+      const tag = String(assign.value || "").trim();
+      if (!tag) return;
+      assign.value = "";
+      try {
+        await addTagToCurrentVideo(tag);
+      } catch (e) {
+        setStatus(e.message, "error");
+      }
+    });
+  }
+
+  if (remove) {
+    remove.addEventListener("change", async () => {
+      const tag = String(remove.value || "").trim();
+      if (!tag) return;
+      remove.value = "";
+      try {
+        await removeTagFromCurrentVideo(tag);
+      } catch (e) {
+        setStatus(e.message, "error");
+      }
+    });
+  }
+
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      clearSourceSelection({ rerender: true });
+    });
+  }
+
+  if (selectAllBtn) {
+    selectAllBtn.addEventListener("click", () => {
+      selectAllSourceResults({ rerender: true });
+    });
+  }
+
   refreshTagEditorForCurrentVideo();
+  updateSourceSelectionClearButton();
+  updateSourceSelectionSelectAllResultsButton();
 }
 
 function setupClipEditorUI() {
@@ -2227,11 +2717,26 @@ function renderFolders(listData) {
     row.dataset.relpath = v.relpath;
     row.innerHTML = `
       <div class="item-left">
+        <input class="source-select" type="checkbox" ${state.sourceSelectedRelpaths instanceof Set && state.sourceSelectedRelpaths.has(String(v.relpath || "")) ? "checked" : ""} />
         <span class="badge">VID</span>
         <div class="name">${escapeHtml(v.name)}</div>
       </div>
       <div></div>
     `;
+
+    const cb = row.querySelector(".source-select");
+    if (cb) {
+      cb.addEventListener("mousedown", (e) => e.stopPropagation());
+      cb.addEventListener("click", (e) => {
+        e.stopPropagation();
+        handleSourceCheckboxToggle({
+          containerKind: "folders",
+          relpath: v.relpath,
+          checked: Boolean(cb.checked),
+          shiftKey: Boolean(e.shiftKey),
+        });
+      });
+    }
 
     row.addEventListener("dragstart", (e) => {
       e.dataTransfer.setData("text/plain", v.relpath);
@@ -2495,6 +3000,14 @@ function renderQueue(items) {
   const el = $("queueList");
   el.innerHTML = "";
 
+  if (!(state.queueSelectedIds instanceof Set)) {
+    state.queueSelectedIds = new Set();
+  }
+  const validIds = new Set(state.queue.map((it) => Number(it.id)).filter((n) => Number.isFinite(n) && n > 0));
+  for (const id of Array.from(state.queueSelectedIds)) {
+    if (!validIds.has(Number(id))) state.queueSelectedIds.delete(id);
+  }
+
   for (const it of state.queue) {
     const row = document.createElement("div");
     row.className = "queue-item";
@@ -2503,7 +3016,8 @@ function renderQueue(items) {
 
     row.innerHTML = `
       <div class="item-left" style="min-width:0;">
-        <span class="badge">#${it.position}</span>
+        <input class="queue-select" type="checkbox" ${state.queueSelectedIds.has(Number(it.id)) ? "checked" : ""} />
+        <span class="badge queue-drag-handle">#${it.position}</span>
         <div class="name">${escapeHtml(it.filename)}</div>
       </div>
       <div class="queue-actions">
@@ -2511,6 +3025,27 @@ function renderQueue(items) {
         <button class="btn" type="button" data-action="remove">Entfernen</button>
       </div>
     `;
+
+    const cb = row.querySelector(".queue-select");
+    if (cb) {
+      cb.addEventListener("mousedown", (e) => {
+        e.stopPropagation();
+      });
+      cb.addEventListener("touchstart", (e) => {
+        e.stopPropagation();
+      });
+      cb.addEventListener("click", (e) => {
+        e.stopPropagation();
+      });
+      cb.addEventListener("change", () => {
+        const idNum = Number(it.id);
+        if (!Number.isFinite(idNum) || idNum <= 0) return;
+        if (cb.checked) state.queueSelectedIds.add(idNum);
+        else state.queueSelectedIds.delete(idNum);
+        updateQueueSelectedDownloadButton();
+        updateQueueSelectAllCheckbox();
+      });
+    }
 
     row.querySelector("button").addEventListener("click", () => {
       playTarget(it.target_relpath);
@@ -2534,9 +3069,12 @@ function renderQueue(items) {
 
   updateActivePlayingHighlights();
 
+  updateQueueSelectedDownloadButton();
+
   if (!state.sortable) {
     state.sortable = new Sortable(el, {
       animation: 150,
+      handle: ".queue-drag-handle",
       onEnd: async () => {
         await persistQueueOrder();
       },
@@ -2616,6 +3154,8 @@ async function main() {
   setupBrowserListSplitter();
   setupDropZone();
   setupQueueControls();
+  setupQueueSelectAllUI();
+  setupQueueSelectedDownloadUI();
   setupMergeDownloadUI();
   setupTagSearchUI();
   setupTagEditorUI();
